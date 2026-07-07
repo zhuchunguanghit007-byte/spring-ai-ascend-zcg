@@ -30,7 +30,7 @@ import java.util.Map;
  *
  * <p>六职责：</p>
  * <ol>
- *     <li>{@link #beforeInvoke}：首轮开场（仅 {@code request_start}，无条件）。</li>
+ *     <li>{@link #beforeInvoke}：首轮开场（request_start 不作为独立事件，对齐 Python 理念）。</li>
  *     <li>{@link #beforeToolCall}：ask_user 解析 {@code response_template_*} / cancel_task 写 reason → {@code _edp_response_template}。</li>
  *     <li>{@link #afterToolCall}：call_versatile/call_mcp 结果话术兜底。</li>
  *     <li>{@link #afterInvoke}：出口发射 {@code _edp_response_template}（对齐 Python 流末出口）。</li>
@@ -63,20 +63,14 @@ public class ScriptsRail extends DeepAgentRail {
     }
 
     // ═══════════════════════════════════════════════════
-    // ① 首轮开场（对齐 Python agent.py:505-512）
+    // ① 首轮开场（对齐 Python 理念：request_start 不作为独立事件）
     // ═══════════════════════════════════════════════════
 
     @Override
     public void beforeInvoke(AgentCallbackContext ctx) {
-        if (scripts == null || !isFirstTurn(ctx)) {
-            return;
-        }
-        // 仅发 request_start（首轮开场，无条件，UC-C05 A2：非法/空请求仍送 request_start）。
-        // planning_start 解耦到 beforeToolCall：仅在 Agent 真正进入规划（todo_create / PLAN_FIRST
-        // 拦截）时发射，避免「你好」等无规划请求误发 planning_start（UC-C05：planning_start
-        // 语义=进入规划阶段，无配对事件）。
-        emitScript(ctx, EdpaEventType.REQUEST_START.wireName(),
-                ScriptResolver.resolve(scripts, EdpaEventType.REQUEST_START.wireName(), Map.of()));
+        // request_start 不作为独立事件发射（对齐 Python 理念）。
+        // 首轮开场感知由 conversation_start 承载；出口话术通过 conversation_end content 输出。
+        // planning 阶段提示由 think_chunk 固定帧话术承载。
     }
 
     // ═══════════════════════════════════════════════════
@@ -236,7 +230,7 @@ public class ScriptsRail extends DeepAgentRail {
 
     @Override
     public void afterInvoke(AgentCallbackContext ctx) {
-        // 出口 request_start 已由 EdpaEventRail.afterInvoke（priority=80）在 conversation_end 之前发射。
+        // 出口话术已由 EdpaEventRail.afterInvoke（priority=80）通过 conversation_end content 输出。
         // 本 Rail（priority=50）不再重复发射，仅执行合规把关（若 _edp_response_template 仍存在）。
         String text = readResponseTemplate(ctx);
         if (isBlank(text)) {

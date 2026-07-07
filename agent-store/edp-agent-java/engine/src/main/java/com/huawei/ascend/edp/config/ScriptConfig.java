@@ -1,6 +1,7 @@
 package com.huawei.ascend.edp.config;
 
 import java.util.List;
+import java.util.Map;
 
 /**
  * scriptconfig.yaml 配置模型。
@@ -18,6 +19,9 @@ public class ScriptConfig {
     /** 通用话术配置。 */
     private GeneralScripts generalScripts;
 
+    /** 工具级话术匹配模板（仅影响 todo_start/todo_end，不影响 tool_start/tool_end）。 */
+    private Map<String, QueryIntentEntry> queryIntentToolText;
+
     /** 思维链话术配置。 */
     private ThinkChunkScripts thinkChunkScripts;
 
@@ -26,6 +30,9 @@ public class ScriptConfig {
 
     public GeneralScripts getGeneralScripts() { return generalScripts; }
     public void setGeneralScripts(GeneralScripts generalScripts) { this.generalScripts = generalScripts; }
+
+    public Map<String, QueryIntentEntry> getQueryIntentToolText() { return queryIntentToolText; }
+    public void setQueryIntentToolText(Map<String, QueryIntentEntry> queryIntentToolText) { this.queryIntentToolText = queryIntentToolText; }
 
     public ThinkChunkScripts getThinkChunkScripts() { return thinkChunkScripts; }
     public void setThinkChunkScripts(ThinkChunkScripts thinkChunkScripts) { this.thinkChunkScripts = thinkChunkScripts; }
@@ -128,7 +135,13 @@ public class ScriptConfig {
         
         /** 续轮话术列表（替代式覆盖，场景有配置时以场景替代框架默认）。 */
         private List<String> resumeScripts;
-        
+
+        /** resuming 阶段是否输出固定话术（false=静默，不输出固定话术也不出真实 token）。 */
+        private Boolean enableResumeScripts;
+
+        /** 向后兼容：阶段化字段全空时降级使用。 */
+        private List<String> scripts;
+
         /** 按用户 query 关键词匹配的话术组列表（planning 阶段，追加策略：框架通用模式 + 场景业务关键词）。 */
         private List<QueryPattern> queryPatterns;
 
@@ -152,6 +165,12 @@ public class ScriptConfig {
 
         public List<String> getResumeScripts() { return resumeScripts; }
         public void setResumeScripts(List<String> resumeScripts) { this.resumeScripts = resumeScripts; }
+
+        public Boolean getEnableResumeScripts() { return enableResumeScripts; }
+        public void setEnableResumeScripts(Boolean enableResumeScripts) { this.enableResumeScripts = enableResumeScripts; }
+
+        public List<String> getScripts() { return scripts; }
+        public void setScripts(List<String> scripts) { this.scripts = scripts; }
 
         public List<QueryPattern> getQueryPatterns() { return queryPatterns; }
         public void setQueryPatterns(List<QueryPattern> queryPatterns) { this.queryPatterns = queryPatterns; }
@@ -187,5 +206,22 @@ public class ScriptConfig {
 
         public String getCancelConfirm() { return cancelConfirm; }
         public void setCancelConfirm(String cancelConfirm) { this.cancelConfirm = cancelConfirm; }
+    }
+
+    /**
+     * 工具级话术匹配条目（按 query_intent 精确匹配）。
+     *
+     * <p>仅影响 todo_start/todo_end，不影响 tool_start/tool_end（E-04 澄清）。
+     * 对齐 Python QUERY_INTENT_TO_TODO_TEXT。</p>
+     */
+    public static class QueryIntentEntry {
+        private String toolStart;
+        private String toolEnd;
+
+        public String getToolStart() { return toolStart; }
+        public void setToolStart(String toolStart) { this.toolStart = toolStart; }
+
+        public String getToolEnd() { return toolEnd; }
+        public void setToolEnd(String toolEnd) { this.toolEnd = toolEnd; }
     }
 }

@@ -9,8 +9,6 @@ package com.huawei.ascend.edp.config;
  * <p>事件配对规则：</p>
  * <ul>
  *   <li>conversation_start ↔ conversation_end（会话级，1:1）</li>
- *   <li>request_start（无配对，用户请求已接收）</li>
- *   <li>planning_start（无配对，开始规划）</li>
  *   <li>think_start ↔ think_end（每轮 LLM 推理，1:1）</li>
  *   <li>final_answer_start ↔ final_answer_end（最终回答，1:1）</li>
  *   <li>tool_start ↔ tool_end（业务工具，1:1）</li>
@@ -21,19 +19,16 @@ package com.huawei.ascend.edp.config;
  *   <li>interrupt_start ↔ interrupt_end（用户中断，跨轮配对）</li>
  *   <li>error_event（异常，无配对）</li>
  * </ul>
- * <p>共 22 种事件类型（含 todo_status / tool_status 中间状态事件，暂不发射但预留枚举位）。</p>
+ * <p>共 20 种事件类型（含 todo_status / tool_status 中间状态事件，暂不发射但预留枚举位）。</p>
+ * <p>注：request_start / planning_start 不作为独立事件类型（对齐 Python 理念）。
+ * request_start 话术通过 conversation_end 的 content 字段输出；
+ * planning 阶段提示由 think_chunk 固定帧话术承载。</p>
  */
 public enum EdpaEventType {
 
     // 会话生命周期
     CONVERSATION_START("conversation_start"),
     CONVERSATION_END("conversation_end"),
-
-    // 用户请求接收（beforeInvoke，conversation_start 之后）
-    REQUEST_START("request_start"),
-
-    // 规划开始（todo_create 前或首轮 think 前）
-    PLANNING_START("planning_start"),
 
     // 思维链（每轮 LLM 推理一对）
     THINK_START("think_start"),

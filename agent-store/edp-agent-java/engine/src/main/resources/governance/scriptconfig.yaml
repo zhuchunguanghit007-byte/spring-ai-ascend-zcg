@@ -52,8 +52,14 @@ scriptconfig:
 
       # ── resuming 阶段话术（Cascade 续轮，query="continue"）─────────
       # 当用户在中断后回复触发续轮时使用
+      # enable_resume_scripts=false → resuming 阶段静默（不输出固定话术，也不出真实 token）
+      enable_resume_scripts: false
       resume_scripts:
         - "当前业务步骤已为您处理完毕"
+
+      # 向后兼容：阶段化字段全空时降级使用
+      scripts:
+        - "正在分析您的需求..."
 
   # ask_user 中断确认话术配置
   # @用途: 用户确认购买/取消等中断场景的话术模板

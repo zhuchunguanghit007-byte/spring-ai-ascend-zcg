@@ -2,8 +2,10 @@ package com.huawei.ascend.edp.config;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.regex.Matcher;
@@ -113,6 +115,33 @@ public final class ScriptResolver {
         return resolve(cfg, EdpaEventType.TODO_END.wireName(), Map.of("title", safe(title)));
     }
 
+    /**
+     * 任务级话术匹配：query_intent 精确匹配 → 兜底 {title}。
+     * 仅影响 todo_start/todo_end（E-04 澄清），不影响 tool_start/tool_end。
+     * 对齐 Python QUERY_INTENT_TO_TODO_TEXT。
+     */
+    public static String todoStart(SysScriptsConfig cfg, String queryIntent, String title) {
+        if (queryIntent != null && !queryIntent.isBlank() && cfg != null) {
+            String key = "query_intent_tool_text." + queryIntent + ".tool_start";
+            String matched = cfg.getTemplate(key);
+            if (matched != null && !matched.isBlank()) {
+                return matched;
+            }
+        }
+        return resolve(cfg, EdpaEventType.TODO_START.wireName(), Map.of("title", safe(title)));
+    }
+
+    public static String todoEnd(SysScriptsConfig cfg, String queryIntent, String title) {
+        if (queryIntent != null && !queryIntent.isBlank() && cfg != null) {
+            String key = "query_intent_tool_text." + queryIntent + ".tool_end";
+            String matched = cfg.getTemplate(key);
+            if (matched != null && !matched.isBlank()) {
+                return matched;
+            }
+        }
+        return resolve(cfg, EdpaEventType.TODO_END.wireName(), Map.of("title", safe(title)));
+    }
+
     public static String todolistStart(SysScriptsConfig cfg) {
         return cfg == null ? "" : safe(cfg.getTemplate(EdpaEventType.TODOLIST_START.wireName()));
     }
@@ -123,6 +152,134 @@ public final class ScriptResolver {
 
     public static String interruptStart(SysScriptsConfig cfg) {
         return cfg == null ? "" : safe(cfg.getTemplate(EdpaEventType.INTERRUPT_START.wireName()));
+    }
+
+    public static String requestStart(SysScriptsConfig cfg) {
+        return getScriptByEvent(cfg, ScriptEvent.REQUEST_START);
+    }
+
+    public static String planningStart(SysScriptsConfig cfg) {
+        return getScriptByEvent(cfg, ScriptEvent.PLANNING_START);
+    }
+
+    public static String getScriptByEvent(SysScriptsConfig cfg, ScriptEvent event) {
+        if (cfg == null || event == null) {
+            return "";
+        }
+        return safe(cfg.getTemplate(event.getKey()));
+    }
+
+    public static String getScriptByKey(SysScriptsConfig cfg, String key) {
+        return cfg == null ? "" : safe(cfg.getTemplate(key));
+    }
+
+    // ═══════════════════════════════════════════════════
+    // 固定帧 think_chunk 切分（对齐 Python select_fixed_scripts + feeder）
+    // ═══════════════════════════════════════════════════
+
+    private static final String FK_PREFIX = "scriptconfig.think_chunk_scripts.think_chunk_fixed_scripts.";
+    private static final String FK_MODE = "scriptconfig.think_chunk_scripts.think_chunk_mode";
+
+    public static boolean isFixedScriptMode(SysScriptsConfig cfg) {
+        if (cfg == null) {
+            return false;
+        }
+        String mode = cfg.getTemplate(FK_MODE);
+        if (!"fixed_script".equals(mode)) {
+            return false;
+        }
+        String enabled = cfg.getTemplate(FK_PREFIX + "enabled");
+        return "true".equalsIgnoreCase(enabled);
+    }
+
+    public static List<String> selectFixedScripts(SysScriptsConfig cfg, String phase, String userQuery) {
+        if (cfg == null) {
+            return List.of();
+        }
+        switch (phase) {
+            case "planning":
+                // ★ 从配置中读取 query_patterns 进行关键词匹配（替代硬编码）
+                List<String> matchedScripts = cfg.matchQueryPatterns(userQuery);
+                if (!matchedScripts.isEmpty()) {
+                    return matchedScripts;
+                }
+                // 未命中时降级到 default_scripts
+                List<String> defScripts = parseScriptList(cfg.getTemplate(FK_PREFIX + "default_scripts"));
+                if (!defScripts.isEmpty()) {
+                    return defScripts;
+                }
+                return parseScriptList(cfg.getTemplate(FK_PREFIX + "scripts"));
+            case "executing":
+                List<String> execScripts = parseScriptList(cfg.getTemplate(FK_PREFIX + "execution_scripts"));
+                if (!execScripts.isEmpty()) {
+                    return execScripts;
+                }
+                return parseScriptList(cfg.getTemplate(FK_PREFIX + "scripts"));
+            case "resuming":
+                String enableResume = cfg.getTemplate(FK_PREFIX + "enable_resume_scripts");
+                if ("false".equalsIgnoreCase(enableResume)) {
+                    return List.of();
+                }
+                List<String> resumeScripts = parseScriptList(cfg.getTemplate(FK_PREFIX + "resume_scripts"));
+                if (!resumeScripts.isEmpty()) {
+                    return resumeScripts;
+                }
+                return parseScriptList(cfg.getTemplate(FK_PREFIX + "scripts"));
+            default:
+                return parseScriptList(cfg.getTemplate(FK_PREFIX + "default_scripts"));
+        }
+    }
+
+    public static List<String> splitFixedScriptsIntoFrames(List<String> scripts, int charsPerFrame) {
+        List<String> result = new ArrayList<>();
+        if (scripts == null || scripts.isEmpty()) {
+            return result;
+        }
+        for (String script : scripts) {
+            if (script == null || script.isBlank()) {
+                continue;
+            }
+            if (charsPerFrame <= 0) {
+                result.add(script);
+                continue;
+            }
+            for (int i = 0; i < script.length(); i += charsPerFrame) {
+                result.add(script.substring(i, Math.min(i + charsPerFrame, script.length())));
+            }
+        }
+        return result;
+    }
+
+    private static List<String> parseScriptList(String raw) {
+        List<String> result = new ArrayList<>();
+        if (raw == null || raw.isBlank()) {
+            return result;
+        }
+        for (String line : raw.split("\n")) {
+            String trimmed = line.trim();
+            if (!trimmed.isEmpty()) {
+                if (trimmed.startsWith("- ")) {
+                    trimmed = trimmed.substring(2);
+                } else if (trimmed.startsWith("-")) {
+                    trimmed = trimmed.substring(1).trim();
+                }
+                if (!trimmed.isEmpty()) {
+                    result.add(trimmed);
+                }
+            }
+        }
+        return result;
+    }
+
+    public static int parseIntOrDefault(String value, int def) {
+        if (value == null || value.isBlank()) {
+            return def;
+        }
+        try {
+            return Integer.parseInt(value.trim());
+        } catch (NumberFormatException e) {
+            return def;
+        }
     }
 
     // ═══════════════════════════════════════════════════

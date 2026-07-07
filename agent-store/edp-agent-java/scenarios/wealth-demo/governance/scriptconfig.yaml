@@ -23,6 +23,26 @@ scriptconfig:
     fund_planning_failed: "理财购买未成功，请稍后重试。"
     mcp_result_empty: "未查询到相关结果。"
 
+  # 工具级话术匹配模板（仅影响 todo_start/todo_end，不影响 tool_start/tool_end）
+  # @用途: 按 query_intent 精确匹配任务级话术，未命中降级兜底 {title}
+  # @对齐: Python QUERY_INTENT_TO_TODO_TEXT
+  query_intent_tool_text:
+    "查询账户余额":
+      tool_start: "正在查询账户余额..."
+      tool_end: "已查询账户余额"
+    "快速转账":
+      tool_start: "正在执行资金转账..."
+      tool_end: "资金转账结束"
+    "理财购买":
+      tool_start: "正在办理理财产品购买..."
+      tool_end: "理财产品购买流程结束"
+    "理财选品购买":
+      tool_start: "正在办理理财产品购买..."
+      tool_end: "理财产品购买流程结束"
+    "理财推荐":
+      tool_start: "正在获取理财产品列表..."
+      tool_end: "已获取理财产品列表"
+
   think_chunk_scripts:
     think_chunk_fixed_scripts:
       # 按用户 query 关键词匹配的话术组（planning 阶段，继承式覆盖）

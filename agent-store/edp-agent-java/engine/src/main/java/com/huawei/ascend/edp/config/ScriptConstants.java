@@ -34,6 +34,8 @@ public final class ScriptConstants {
 
     // ── 话术配置 key（业务类，ScriptsConfig.yaml 顶层平铺 key）──
 
+    public static final String SCRIPT_REQUEST_START = "request_start";
+    public static final String SCRIPT_PLANNING_START = "planning_start";
     public static final String SCRIPT_TASK_CANCELLED = "task_cancelled";
     public static final String SCRIPT_CANCEL_CONFIRM = "cancel_confirm";
     public static final String SCRIPT_OUT_OF_SCOPE = "out_of_scope";

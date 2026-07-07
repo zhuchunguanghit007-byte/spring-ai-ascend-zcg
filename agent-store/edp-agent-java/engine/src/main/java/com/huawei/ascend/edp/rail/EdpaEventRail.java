@@ -2,6 +2,7 @@ package com.huawei.ascend.edp.rail;
 
 import com.huawei.ascend.edp.config.EdpaEventType;
 import com.huawei.ascend.edp.config.ScriptConstants;
+import com.huawei.ascend.edp.config.ScriptEvent;
 import com.huawei.ascend.edp.config.ScriptResolver;
 import com.huawei.ascend.edp.config.SysScriptsConfig;
 import com.huawei.ascend.edp.config.ToolConstants;
@@ -76,6 +77,15 @@ public class EdpaEventRail extends DeepAgentRail {
 
     /** 延迟 think 的 extra key：当 LLM 本轮只调用 todo_modify 时，think 延迟到 todo_end 之后发射。 */
     private static final String KEY_PENDING_THINK = "_edp_pending_think";
+
+    /** 缓存 call_versatile 的 query_intent 参数（供后续 todo_modify 的 todo_start/end 使用，对齐 Python _last_query_intent）。 */
+    private static final String KEY_LAST_QUERY_INTENT = "_edp_last_query_intent";
+
+    /** 标记是否需要发射 request_start（conversation_start 后）。 */
+    private static final String KEY_PENDING_REQUEST_START = "_edp_pending_request_start";
+
+    /** 标记是否需要发射 planning_start（有 todo 规划时）。 */
+    private static final String KEY_PENDING_PLANNING_START = "_edp_pending_planning_start";
 
     /**
      * 上一轮发射的 todolist 指纹，用于检测任务列表是否变化并决定是否重推。
@@ -194,6 +204,22 @@ public class EdpaEventRail extends DeepAgentRail {
                 sid, diagTodosSummary(ctx));
         emit(ctx, EdpaEventType.CONVERSATION_START, Map.of());
         initTodoStateSilent(ctx, sid);
+
+        // 发射 request_start（通过 INTERRUPT_START，interrupt_id="response_template"）
+        String requestStartContent = ScriptResolver.requestStart(scripts);
+        if (requestStartContent != null && !requestStartContent.isBlank()) {
+            String interruptId = "response_template";
+            LOGGER.info("[EDPA-DIAG] beforeInvoke sid={} -> emit interrupt_start for request_start", sid);
+            emit(ctx, EdpaEventType.INTERRUPT_START, Map.of(
+                    "tool", "",
+                    "content", requestStartContent,
+                    "interrupt_id", interruptId));
+        }
+
+        // ★ 注意：planning_start 的标记不在这里设置
+        // planning_start 只在检测到规划行为时发送（Rule 13）：
+        // 1. afterModelCall 中 LLM 返回 todo_create
+        // 2. beforeToolCall 中 PLAN_FIRST 拦截
     }
 
     /**
@@ -246,28 +272,41 @@ public class EdpaEventRail extends DeepAgentRail {
         // reasoning 仅为标点占位（如 "." / "。"）时视为无数据，回退到 content（LLM 实际输出）。
         String thinkContent = (reasoning != null && reasoning.strip().length() > 1) ? reasoning : content;
 
-        // planning_start（无配对，开始规划）：必须在 think_start 之前发射（EdpaEventType 枚举生命周期
-        // 顺序：request_start → planning_start → think_start → … → todolist_start）。仅当本轮模型决定
-        // 调用 todo_create（主动规划）时发一次（per-request 去重）。寒暄/超范围/直接作答的轮次
-        // tool_calls 不含 todo_create，不发——故「你好」不会出现 planning_start。
-        if (containsTodoCreate(msg)) {
-            maybeEmitPlanningStart(ctx, sid);
+        // ★ Rule 13：检测 LLM 返回了 todo_create（主动规划）→ 标记发射 planning_start
+        if (msg.getToolCalls() != null) {
+            for (ToolCall tc : msg.getToolCalls()) {
+                if (TOOL_TODO_CREATE.equals(tc.getName())) {
+                    ctx.getExtra().put(KEY_PENDING_PLANNING_START, true);
+                    LOGGER.info("[EDPA-DIAG] afterModelCall sid={} -> 检测到 todo_create，标记发射 planning_start", sid);
+                    break;
+                }
+            }
         }
 
-        // ① 发 think 对（每轮 LLM 一对，严格配对，Rule 2）
+        // ★ 调整顺序：planning_start → think → todolist（用户要求）
+        // ① 先发射 planning_start（如果有标记）
+        Boolean pendingPlanning = (Boolean) ctx.getExtra().get(KEY_PENDING_PLANNING_START);
+        if (pendingPlanning != null && pendingPlanning) {
+            String planningStartContent = ScriptResolver.planningStart(scripts);
+            if (planningStartContent != null && !planningStartContent.isBlank()) {
+                String interruptId = "response_template";
+                LOGGER.info("[EDPA-DIAG] afterModelCall sid={} -> emit planning_start BEFORE think", sid);
+                emit(ctx, EdpaEventType.INTERRUPT_START, Map.of(
+                        "tool", "",
+                        "content", planningStartContent,
+                        "interrupt_id", interruptId));
+            }
+            ctx.getExtra().remove(KEY_PENDING_PLANNING_START);
+        }
+
+        // ② 发 think 对（每轮 LLM 一对，严格配对，Rule 2）
         // 如果本轮 LLM 只调用 todo_modify（无业务工具），延迟 think 到 afterToolCall 的 todo_end 之后发射，
         // 使事件流为 tool_end → todo_end → think → todolist（而非 tool_end → think → todo_end → todolist）。
         if (isOnlyTodoModify(msg)) {
             ctx.getExtra().put(KEY_PENDING_THINK, thinkContent);
             LOGGER.info("[EDPA-DIAG] afterModelCall sid={} -> delay think (onlyTodoModify)", sid);
         } else {
-            thinkOpen.put(sid, true);
-            emit(ctx, EdpaEventType.THINK_START, Map.of());
-            if (!thinkContent.isBlank()) {
-                emit(ctx, EdpaEventType.THINK_CHUNK, Map.of("content", thinkContent));
-            }
-            emit(ctx, EdpaEventType.THINK_END, Map.of());
-            thinkOpen.put(sid, false);
+            emitThinkPair(ctx, sid, thinkContent);
         }
 
         // ② finish_reason=stop 且无 tool_calls → 发 final_answer 对
@@ -297,10 +336,10 @@ public class EdpaEventRail extends DeepAgentRail {
         }
         String sid = sessionId(ctx);
         // PLAN_FIRST 真拦截（EdpaTodoRail 未规划 todo 时拦截，工具未执行）→ 不发 tool_start；
-        // 但视为「进入规划阶段」（强制规划），发 planning_start（per-request 一次）。
+        // 标记需要发射 planning_start（在 afterModelCall 中发射）
         if (Boolean.TRUE.equals(ctx.getExtra().get(ScriptConstants.KEY_PLAN_FIRST_BLOCK))) {
-            maybeEmitPlanningStart(ctx, sid);
-            LOGGER.info("[EDPA-DIAG] beforeToolCall tool={} PLAN_FIRST_BLOCK (真拦截, 不发 tool_start)", toolName);
+            ctx.getExtra().put(KEY_PENDING_PLANNING_START, true);
+            LOGGER.info("[EDPA-DIAG] beforeToolCall tool={} PLAN_FIRST_BLOCK -> 标记发射 planning_start", toolName);
             ToolCall tc = inputs.getToolCall();
             if (tc != null && tc.getId() != null) {
                 skippedToolCallIds.add(tc.getId());
@@ -309,6 +348,15 @@ public class EdpaEventRail extends DeepAgentRail {
         }
         // 中断接管型（_skip_tool=true 但非 PLAN_FIRST）或真实执行：工具已执行/将执行 → 发 tool_start
         String mode = Boolean.TRUE.equals(ctx.getExtra().get(ScriptConstants.KEY_SKIP_TOOL)) ? "interrupt-handled" : "real-exec";
+        // 缓存 call_versatile 的 query_intent 参数（供后续 todo_modify 的 todo_start/end 使用，对齐 Python _last_query_intent）
+        if (TOOL_CALL_VERSATILE.equals(toolName)) {
+            Map<String, Object> args = normalizeToolArgs(inputs.getToolArgs());
+            String queryIntent = String.valueOf(args.getOrDefault("query_intent", ""));
+            if (!queryIntent.isBlank() && !"null".equals(queryIntent)) {
+                ctx.getExtra().put(KEY_LAST_QUERY_INTENT, queryIntent);
+                LOGGER.info("[EDPA-DIAG] beforeToolCall tool={} cached query_intent={}", toolName, queryIntent);
+            }
+        }
         LOGGER.info("[EDPA-DIAG] beforeToolCall tool={} mode={} -> emit tool_start", toolName, mode);
         toolOpen.put(sid, true);
         emit(ctx, EdpaEventType.TOOL_START, Map.of(
@@ -363,6 +411,8 @@ public class EdpaEventRail extends DeepAgentRail {
                 endPayload.put("interrupt_id", interruptId != null ? interruptId : "");
                 emit(ctx, EdpaEventType.INTERRUPT_END, endPayload);
                 interruptActive.remove(sid);
+                // 标记刚刚恢复（供 afterModelCall 选择 resuming 话术，对齐 Python is_resuming）
+                ctx.getExtra().put(KEY_JUST_RESUMED, true);
             }
             return;
         }
@@ -378,13 +428,7 @@ public class EdpaEventRail extends DeepAgentRail {
         if (pendingThink != null) {
             String pendingSid = sessionId(ctx);
             String thinkContent = String.valueOf(pendingThink);
-            thinkOpen.put(pendingSid, true);
-            emit(ctx, EdpaEventType.THINK_START, Map.of());
-            if (!thinkContent.isBlank()) {
-                emit(ctx, EdpaEventType.THINK_CHUNK, Map.of("content", thinkContent));
-            }
-            emit(ctx, EdpaEventType.THINK_END, Map.of());
-            thinkOpen.put(pendingSid, false);
+            emitThinkPair(ctx, pendingSid, thinkContent);
             ctx.getExtra().remove(KEY_PENDING_THINK);
             LOGGER.info("[EDPA-DIAG] afterToolCall sid={} -> emit delayed think (fallback)", pendingSid);
         }
@@ -503,27 +547,27 @@ public class EdpaEventRail extends DeepAgentRail {
     @Override
     public void afterInvoke(AgentCallbackContext ctx) {
         String sid = sessionId(ctx);
-        // 出口 request_start：在 conversation_end 之前发射（EdpaEventRail priority=80 是唯一出口发射者）
-        // 当本轮有 interrupt_start（ask_user 中断）时不发射——interrupt_start.content 已携带话术文本，request_start 冗余
+        // 出口话术：不作为独立事件（对齐 Python 理念），通过 conversation_end 的 content 字段输出。
+        // 当本轮有 interrupt_start（ask_user 中断）时不输出——interrupt_start.content 已携带话术文本，冗余。
+        String exitContent = "";
         Object rt = ctx.getExtra().get(ScriptConstants.KEY_RESPONSE_TEMPLATE);
         if (rt != null && !String.valueOf(rt).isBlank()) {
             if (!interruptActive.getOrDefault(sid, false)) {
-                String resolved = String.valueOf(rt);
+                exitContent = String.valueOf(rt);
                 // 合规把关：配置外话术 → 替换为 out_of_scope
                 Object lastKey = ctx.getExtra().get(ScriptConstants.KEY_LAST_SCRIPT);
                 if (scripts != null && lastKey != null && !scripts.has(String.valueOf(lastKey))) {
-                    resolved = scripts.getOrDefault(ScriptConstants.SCRIPT_OUT_OF_SCOPE, "");
+                    exitContent = scripts.getOrDefault(ScriptConstants.SCRIPT_OUT_OF_SCOPE, "");
                     LOGGER.info("[EDPA-DIAG] afterInvoke sid={} -> compliance gate replaced key={}", sid, lastKey);
                 }
-                LOGGER.info("[EDPA-DIAG] afterInvoke sid={} -> emit exit request_start (before conversation_end)", sid);
-                emit(ctx, EdpaEventType.REQUEST_START, Map.of("content", resolved));
+                LOGGER.info("[EDPA-DIAG] afterInvoke sid={} -> exit content attached to conversation_end", sid);
             } else {
-                LOGGER.info("[EDPA-DIAG] afterInvoke sid={} -> skip exit request_start (interrupt active, content redundant)", sid);
+                LOGGER.info("[EDPA-DIAG] afterInvoke sid={} -> skip exit content (interrupt active, content redundant)", sid);
             }
             ctx.getExtra().remove(ScriptConstants.KEY_RESPONSE_TEMPLATE);
         }
         LOGGER.info("[EDPA-DIAG] afterInvoke sid={} -> emit conversation_end (if not already closed)", sid);
-        emitConversationEnd(ctx, sid);
+        emitConversationEnd(ctx, sid, exitContent);
         // 清理本轮状态（interruptActive/interruptIdMap 跨轮持久化，不在此清理）
         lastTodolistFingerprint.remove(sid);
         thinkOpen.remove(sid);
@@ -638,12 +682,21 @@ public class EdpaEventRail extends DeepAgentRail {
      * <p>异常处理（onModelException / onToolException 非中断）可能已发射 conversation_end，
      * afterInvoke 检查 conversationClosed 标记避免重复发射。</p>
      */
-    private void emitConversationEnd(AgentCallbackContext ctx, String sid) {
+    private void emitConversationEnd(AgentCallbackContext ctx, String sid, String content) {
         if (Boolean.TRUE.equals(conversationClosed.get(sid))) {
             return;
         }
-        emit(ctx, EdpaEventType.CONVERSATION_END, Map.of());
+        Map<String, Object> payload = new java.util.LinkedHashMap<>();
+        if (content != null && !content.isBlank()) {
+            payload.put("content", content);
+        }
+        emit(ctx, EdpaEventType.CONVERSATION_END, payload);
         conversationClosed.put(sid, true);
+    }
+
+    /** 无出口话术的 conversation_end 重载（异常/中断路径）。 */
+    private void emitConversationEnd(AgentCallbackContext ctx, String sid) {
+        emitConversationEnd(ctx, sid, "");
     }
 
     // ═══════════════════════════════════════════════════
@@ -818,16 +871,13 @@ public class EdpaEventRail extends DeepAgentRail {
         Object pendingThink = ctx.getExtra().get(KEY_PENDING_THINK);
         if (pendingThink != null) {
             String thinkContent = String.valueOf(pendingThink);
-            thinkOpen.put(sid, true);
-            emit(ctx, EdpaEventType.THINK_START, Map.of());
-            if (!thinkContent.isBlank()) {
-                emit(ctx, EdpaEventType.THINK_CHUNK, Map.of("content", thinkContent));
-            }
-            emit(ctx, EdpaEventType.THINK_END, Map.of());
-            thinkOpen.put(sid, false);
+            emitThinkPair(ctx, sid, thinkContent);
             ctx.getExtra().remove(KEY_PENDING_THINK);
             LOGGER.info("[EDPA-DIAG] emitTodoEvents sid={} -> emit delayed think after todo_end", sid);
         }
+
+        // ★ 注意：planning_start 已在 afterModelCall 中提前发射（调整后顺序为 planning_start → think → todolist）
+        // emitTodoEvents 中不再处理 planning_start，避免重复发射
 
         // ② todolist 刷新：只发1次（end + start 合并，消除重复）
         if (changed) {
@@ -864,6 +914,7 @@ public class EdpaEventRail extends DeepAgentRail {
      * <p>设计文档 v1.1 Rule 5：PENDING/null→IN_PROGRESS 发 todo_start。</p>
      */
     private void emitTodoStarts(AgentCallbackContext ctx, List<TodoItem> todos, Map<String, TodoStatus> prevMap) {
+        String queryIntent = (String) ctx.getExtra().getOrDefault(KEY_LAST_QUERY_INTENT, "");
         for (TodoItem todo : todos) {
             TodoStatus current = todo.getStatus();
             TodoStatus prev = prevMap.get(todo.getId());
@@ -872,7 +923,7 @@ public class EdpaEventRail extends DeepAgentRail {
                         todo.getId(), prev);
                 emit(ctx, EdpaEventType.TODO_START, Map.of(
                         "id", todo.getId(),
-                        "content", ScriptResolver.todoStart(scripts, safe(todo.getContent()))));
+                        "content", ScriptResolver.todoStart(scripts, queryIntent, safe(todo.getContent()))));
             }
         }
     }
@@ -885,6 +936,7 @@ public class EdpaEventRail extends DeepAgentRail {
      * 由 emitTodoEvents 的路径切换分支发独立 todolist（Rule 4④）。</p>
      */
     private void emitTodoEnds(AgentCallbackContext ctx, List<TodoItem> todos, Map<String, TodoStatus> prevMap) {
+        String queryIntent = (String) ctx.getExtra().getOrDefault(KEY_LAST_QUERY_INTENT, "");
         for (TodoItem todo : todos) {
             TodoStatus current = todo.getStatus();
             TodoStatus prev = prevMap.get(todo.getId());
@@ -895,7 +947,7 @@ public class EdpaEventRail extends DeepAgentRail {
                         todo.getId());
                 emit(ctx, EdpaEventType.TODO_END, Map.of(
                         "id", todo.getId(),
-                        "content", ScriptResolver.todoEnd(scripts, safe(todo.getContent())),
+                        "content", ScriptResolver.todoEnd(scripts, queryIntent, safe(todo.getContent())),
                         "status", "completed"));
             }
 
@@ -905,7 +957,7 @@ public class EdpaEventRail extends DeepAgentRail {
                         todo.getId());
                 emit(ctx, EdpaEventType.TODO_END, Map.of(
                         "id", todo.getId(),
-                        "content", ScriptResolver.todoEnd(scripts, safe(todo.getContent())),
+                        "content", ScriptResolver.todoEnd(scripts, queryIntent, safe(todo.getContent())),
                         "status", "cancelled"));
             }
         }
@@ -1006,36 +1058,25 @@ public class EdpaEventRail extends DeepAgentRail {
         return TOOL_CALL_MCP.equals(toolName) || TOOL_CALL_VERSATILE.equals(toolName);
     }
 
-    /**
-     * planning_start 一次性发射（per-request 去重）。
-     *
-     * <p>UC-C05 + EdpaEventType 枚举：planning_start 语义=「Agent 进入规划阶段」，无配对，
-     * 在 think_start 之前发射。触发点：① afterModelCall 检测到本轮模型决定调用 todo_create
-     * （主动规划）；② beforeToolCall 检测到 PLAN_FIRST 拦截（强制规划）。寒暄/超范围/直接作答
-     * 的请求不发。per-request 去重保证同一请求内只发一次。</p>
-     */
-    private void maybeEmitPlanningStart(AgentCallbackContext ctx, String sid) {
-        if (Boolean.TRUE.equals(ctx.getExtra().get(ScriptConstants.KEY_PLANNING_START_SENT))) {
-            return;
+    /** 把工具原始入参归一为 Map<String,Object>（Map 直转 / JSON 字符串解析）。 */
+    @SuppressWarnings("unchecked")
+    private static Map<String, Object> normalizeToolArgs(Object rawArgs) {
+        Map<String, Object> result = new LinkedHashMap<>();
+        if (rawArgs instanceof Map<?, ?> map) {
+            map.forEach((k, v) -> result.put(String.valueOf(k), v));
+            return result;
         }
-        ctx.getExtra().put(ScriptConstants.KEY_PLANNING_START_SENT, Boolean.TRUE);
-        String content = ScriptResolver.resolve(scripts, EdpaEventType.PLANNING_START.wireName(), Map.of());
-        LOGGER.info("[EDPA-DIAG] sid={} -> emit planning_start (planning entry, before think_start)", sid);
-        emit(ctx, EdpaEventType.PLANNING_START, Map.of("content", content));
-    }
-
-    /** 当前模型响应的 tool_calls 是否包含 todo_create（即 LLM 主动进入规划）。 */
-    private static boolean containsTodoCreate(AssistantMessage msg) {
-        List<ToolCall> tcs = msg.getToolCalls();
-        if (tcs == null || tcs.isEmpty()) {
-            return false;
-        }
-        for (ToolCall tc : tcs) {
-            if (tc != null && ToolConstants.TODO_CREATE.equals(tc.getName())) {
-                return true;
+        if (rawArgs instanceof String s && !s.isBlank()) {
+            try {
+                com.fasterxml.jackson.databind.ObjectMapper mapper = new com.fasterxml.jackson.databind.ObjectMapper();
+                Map<String, Object> parsed = mapper.readValue(s,
+                        new com.fasterxml.jackson.core.type.TypeReference<LinkedHashMap<String, Object>>() {});
+                return parsed != null ? parsed : result;
+            } catch (Exception ignore) {
+                // 非 JSON，返回空
             }
         }
-        return false;
+        return result;
     }
 
     /**
@@ -1057,6 +1098,73 @@ public class EdpaEventRail extends DeepAgentRail {
             }
         }
         return true;
+    }
+
+    // ═══════════════════════════════════════════════════
+    // 固定帧 think_chunk 切分（对齐 Python select_fixed_scripts）
+    // ═══════════════════════════════════════════════════
+
+    /** 阶段标识 extra key */
+    private static final String KEY_THINK_TURN_COUNT = "_edp_think_turn_count";
+    private static final String KEY_JUST_RESUMED = "_edp_just_resumed";
+
+    /** 固定帧配置 key 前缀 */
+    private static final String FK_PREFIX = "scriptconfig.think_chunk_scripts.think_chunk_fixed_scripts.";
+
+    /**
+     * 阶段检测：planning（第1轮）/ executing（工具后）/ resuming（中断恢复后）。
+     */
+    private String detectPhase(AgentCallbackContext ctx) {
+        if (Boolean.TRUE.equals(ctx.getExtra().get(KEY_JUST_RESUMED))) {
+            return "resuming";
+        }
+        int turnCount = (int) ctx.getExtra().getOrDefault(KEY_THINK_TURN_COUNT, 0);
+        return turnCount == 0 ? "planning" : "executing";
+    }
+
+    /**
+     * 获取用户原始 query 文本。
+     */
+    private String getUserQuery(AgentCallbackContext ctx) {
+        Object userInput = ctx.getExtra().getOrDefault("_edp_user_input", "");
+        if (userInput instanceof String s) {
+            return s;
+        }
+        return "";
+    }
+
+    /**
+     * 发射 think 对（固定帧模式或真实 token 模式）。
+     */
+    private void emitThinkPair(AgentCallbackContext ctx, String sid, String realThinkContent) {
+        thinkOpen.put(sid, true);
+        emit(ctx, EdpaEventType.THINK_START, Map.of());
+
+        if (ScriptResolver.isFixedScriptMode(scripts)) {
+            String phase = detectPhase(ctx);
+            String userQuery = getUserQuery(ctx);
+            List<String> scriptsList = ScriptResolver.selectFixedScripts(scripts, phase, userQuery);
+            if (!scriptsList.isEmpty()) {
+                int charsPerFrame = ScriptResolver.parseIntOrDefault(scripts.getTemplate(FK_PREFIX + "chars_per_frame"), 4);
+                List<String> frames = ScriptResolver.splitFixedScriptsIntoFrames(scriptsList, charsPerFrame);
+                for (String frame : frames) {
+                    emit(ctx, EdpaEventType.THINK_CHUNK, Map.of("content", frame));
+                }
+            }
+            LOGGER.info("[EDPA-DIAG] sid={} phase={} -> fixed_frame think (frames={})",
+                    sid, phase, scriptsList.size());
+        } else {
+            if (!realThinkContent.isBlank()) {
+                emit(ctx, EdpaEventType.THINK_CHUNK, Map.of("content", realThinkContent));
+            }
+        }
+
+        emit(ctx, EdpaEventType.THINK_END, Map.of());
+        thinkOpen.put(sid, false);
+
+        int turnCount = (int) ctx.getExtra().getOrDefault(KEY_THINK_TURN_COUNT, 0);
+        ctx.getExtra().put(KEY_THINK_TURN_COUNT, turnCount + 1);
+        ctx.getExtra().remove(KEY_JUST_RESUMED);
     }
 
     /**
