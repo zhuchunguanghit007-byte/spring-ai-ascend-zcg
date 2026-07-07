@@ -554,10 +554,10 @@ public class EdpaEventRail extends DeepAgentRail {
         if (rt != null && !String.valueOf(rt).isBlank()) {
             if (!interruptActive.getOrDefault(sid, false)) {
                 exitContent = String.valueOf(rt);
-                // 合规把关：配置外话术 → 替换为 out_of_scope
+                // 合规把关：配置外话术 → 替换为 out_of_scope（使用配置驱动的键映射）
                 Object lastKey = ctx.getExtra().get(ScriptConstants.KEY_LAST_SCRIPT);
                 if (scripts != null && lastKey != null && !scripts.has(String.valueOf(lastKey))) {
-                    exitContent = scripts.getOrDefault(ScriptConstants.SCRIPT_OUT_OF_SCOPE, "");
+                    exitContent = scripts.getScriptOrDefault("SCRIPT_OUT_OF_SCOPE", "");
                     LOGGER.info("[EDPA-DIAG] afterInvoke sid={} -> compliance gate replaced key={}", sid, lastKey);
                 }
                 LOGGER.info("[EDPA-DIAG] afterInvoke sid={} -> exit content attached to conversation_end", sid);

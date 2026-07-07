@@ -295,14 +295,24 @@ class GovernanceConfigLoaderTest {
     }
 
     /**
-     * 创建最简场景级配置（仅含 actrule 和 scriptconfig 空壳），
+     * 创建最简场景级配置（仅含 actrule 空壳），
      * 用于测试仅 planrule 有差异的场景。
+     * 
+     * <p><b>注意</b>：
+     * <ul>
+     *   <li>只创建 actrule.yaml，不创建 scriptconfig.yaml，以避免覆盖测试中已有的 scriptconfig.yaml 配置。</li>
+     *   <li>只在 actrule.yaml 不存在时创建，避免覆盖测试中已有的 actrule.yaml 配置。</li>
+     * </ul>
+     * </p>
      */
     private void createMinimalActruleAndScriptconfig(Path scenarioDir) throws Exception {
-        String actruleYaml = "actrule:\n";
-        Files.writeString(scenarioDir.resolve("actrule.yaml"), actruleYaml);
-        String scriptconfigYaml = "scriptconfig:\n";
-        Files.writeString(scenarioDir.resolve("scriptconfig.yaml"), scriptconfigYaml);
+        Path actrulePath = scenarioDir.resolve("actrule.yaml");
+        if (!Files.exists(actrulePath)) {
+            // 只在文件不存在时创建，避免覆盖测试中已有的配置
+            String actruleYaml = "actrule:\n  skill_mode: all\n";
+            Files.writeString(actrulePath, actruleYaml);
+        }
+        // 不再创建空的 scriptconfig.yaml，避免覆盖测试中已有的配置
     }
 
     @Test

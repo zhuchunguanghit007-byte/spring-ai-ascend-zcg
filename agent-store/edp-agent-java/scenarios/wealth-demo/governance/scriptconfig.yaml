@@ -1,7 +1,10 @@
-# wealth-demo 场景话术（继承式覆盖框架 scriptconfig.yaml 同名 key）
+# wealth-demo 场景话术
+#
+# 本配置适配财富管理场景（理财推荐、购买、查询等业务）
+# 话术键映射自动推断，无需显式声明
+
 scriptconfig:
-  # ── A 面：生命周期事件话术（EdpaEventRail 发射时填充）──
-  # ── B① 首轮开场 / B② 业务话术 / B③ 业务结果话术 ──
+  # ── 生命周期事件话术（EdpaEventRail 发射时填充）──
   general_scripts:
     tool_start: "正在调用：{tool_name}"
     tool_end: "{tool_name} 执行完成"
@@ -15,17 +18,17 @@ scriptconfig:
     task_cancelled: "好的，已为您取消当前操作。如需其他帮助，请随时告诉我。"
     cancel_confirm: "确认要取消当前操作吗？"
     out_of_scope: "当前请求暂不在可处理范围内。"
-    product_select_confirm: "确认购买以下产品：{productName}，金额 {amount} 元。"
-    product_select_missing_amount: "请告诉我您想购买的金额。"
-    product_select_missing_product: "请问您想购买哪款理财产品？"
-    product_recommend_success: "已为您找到合适的理财产品。"
-    fund_planning_success: "理财购买已成功完成，订单号：{orderId}。"
-    fund_planning_failed: "理财购买未成功，请稍后重试。"
-    mcp_result_empty: "未查询到相关结果。"
 
-  # 工具级话术匹配模板（仅影响 todo_start/todo_end，不影响 tool_start/tool_end）
-  # @用途: 按 query_intent 精确匹配任务级话术，未命中降级兜底 {title}
-  # @对齐: Python QUERY_INTENT_TO_TODO_TEXT
+  # ── 业务话术模板 ──
+  product_select_confirm: "确认购买以下产品：{productName}，金额 {amount} 元。"
+  product_select_missing_amount: "请告诉我您想购买的金额。"
+  product_select_missing_product: "请问您想购买哪款理财产品？"
+  product_recommend_success: "已为您找到合适的理财产品。"
+  fund_planning_success: "理财购买已成功完成，订单号：{orderId}。"
+  fund_planning_failed: "理财购买未成功，请稍后重试。"
+  mcp_result_empty: "未查询到相关结果。"
+
+  # ── 工具级话术匹配模板 ──
   query_intent_tool_text:
     "查询账户余额":
       tool_start: "正在查询账户余额..."
@@ -43,10 +46,13 @@ scriptconfig:
       tool_start: "正在获取理财产品列表..."
       tool_end: "已获取理财产品列表"
 
+  # ── 固定帧话术配置 ──
   think_chunk_scripts:
     think_chunk_fixed_scripts:
-      # 按用户 query 关键词匹配的话术组（planning 阶段，继承式覆盖）
-      # 按声明顺序遍历，首个关键词命中即生效；全未命中降级到 default_scripts
+      chars_per_frame: 4
+      tokens_between_frames: 2
+      min_interval_ms: 50
+      
       query_patterns:
         - keywords: ["推荐", "理财", "产品", "筛选"]
           scripts:
@@ -58,10 +64,15 @@ scriptconfig:
           scripts:
             - "正在查询账户信息..."
 
-  # ask_user 中断确认话术模板
-  # @用途: 用户确认购买/取消等中断场景的话术模板
-  # @策略: 继承式覆盖（逐字段合并）
-  # @消费方: AskUserTemplateRail（预留建模，当前未消费）
+      default_scripts:
+        - "正在分析您的需求..."
+      
+      execution_scripts:
+        - "正在分析执行结果..."
+      
+      enable_resume_scripts: false
+
+  # ── ask_user 中断确认话术 ──
   ask_user_confirm:
     purchase_confirm: "确认购买以下产品：{product_name}，金额 {amount} 元。"
     cancel_confirm: "取消当前购买操作。"

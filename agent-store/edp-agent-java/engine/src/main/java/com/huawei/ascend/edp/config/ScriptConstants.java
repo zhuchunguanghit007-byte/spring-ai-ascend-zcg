@@ -5,6 +5,23 @@ package com.huawei.ascend.edp.config;
  *
  * <p>所有 Rail / ScriptResolver 引用话术相关字符串时必须使用此常量类，
  * 禁止在代码中使用字符串字面量。参照 {@link ToolConstants} 模式。</p>
+ *
+ * <h2>配置驱动常量说明</h2>
+ * <p>以下常量不再硬编码键名，而是作为 API 契约供调用方使用。
+ * 实际键名通过场景配置 {@code scriptconfig.yaml} 中的 {@code script_keys} 映射：</p>
+ * <pre>
+ * # 配置示例
+ * scriptconfig:
+ *   script_keys:
+ *     fund_planning_success: "loan_success"  # 覆盖键名
+ *   loan_success: "贷款申请已提交..."         # 实际话术内容
+ * </pre>
+ * <p>调用方使用 {@link SysScriptsConfig#getScriptOrDefault(String, String)} 时，
+ * 内部通过 {@link SysScriptsConfig#resolveScriptKey(String)} 将常量名映射到配置中的实际键名。</p>
+ *
+ * @see SysScriptsConfig#resolveScriptKey(String)
+ * @see SysScriptsConfig#getScriptOrDefault(String, String)
+ * @see SysScriptsConfig#hasScript(String)
  */
 public final class ScriptConstants {
 

@@ -94,20 +94,25 @@ public class ScriptsRail extends DeepAgentRail {
 
     /**
      * cancel_task：写 {@code _edp_response_template}（forceFinish 由 CancelRail 中段执行，payload 非话术）。
+     *
+     * <p>reason 参数值需与 ScriptConstants 常量名一致（如 {@code "task_cancelled"}），
+     * 内部通过 {@link SysScriptsConfig#resolveScriptKey(String)} 映射到实际配置键。</p>
      */
     private void resolveCancelScript(AgentCallbackContext ctx, Map<String, Object> args) {
         String reason = str(args.get("reason"));
         if (isBlank(reason)) {
-            reason = ScriptConstants.SCRIPT_TASK_CANCELLED;
+            reason = "task_cancelled";
         }
-        String text = scripts.getOrDefault(reason, "");
+        // 使用配置驱动的键映射
+        String resolvedKey = scripts.resolveScriptKey("SCRIPT_" + reason.toUpperCase().replace("-", "_"));
+        String text = scripts.getScriptOrDefault("SCRIPT_" + reason.toUpperCase().replace("-", "_"), "");
         if (isBlank(text)) {
             return;
         }
         ctx.getExtra().put(ScriptConstants.KEY_RESPONSE_TEMPLATE, text);
-        ctx.getExtra().put(ScriptConstants.KEY_LAST_SCRIPT, reason);
+        ctx.getExtra().put(ScriptConstants.KEY_LAST_SCRIPT, resolvedKey);
         ctx.getExtra().put(ScriptConstants.KEY_CANCEL_REASON, reason);
-        LOGGER.info("[EDPA-SCRIPT] cancel_task resolved reason={} -> response_template", reason);
+        LOGGER.info("[EDPA-SCRIPT] cancel_task resolved reason={} (resolved={}) -> response_template", reason, resolvedKey);
     }
 
     // ═══════════════════════════════════════════════════
@@ -125,15 +130,17 @@ public class ScriptsRail extends DeepAgentRail {
         if (!ToolConstants.CALL_VERSATILE.equals(tool) && !ToolConstants.CALL_MCP.equals(tool)) {
             return;
         }
-        String key = pickResultScriptKey(tool, inputs.getToolResult());
-        if (isBlank(key) || !scripts.has(key)) {
+        // pickResultScriptKey 返回 ScriptConstants 常量名，内部通过 hasScript/getScriptOrDefault 做映射
+        String constantName = pickResultScriptKey(tool, inputs.getToolResult());
+        if (isBlank(constantName) || !scripts.hasScript(constantName)) {
             return; // 配置缺位不补，不触碰 VersatileRail/McpRail 内部逻辑
         }
-        String text = scripts.getOrDefault(key, "");
+        String text = scripts.getScriptOrDefault(constantName, "");
         if (!isBlank(text)) {
+            String resolvedKey = scripts.resolveScriptKey(constantName);
             ctx.getExtra().put(ScriptConstants.KEY_RESPONSE_TEMPLATE, text);
-            ctx.getExtra().put(ScriptConstants.KEY_LAST_SCRIPT, key);
-            LOGGER.info("[EDPA-SCRIPT] {} result fallback key={} -> response_template", tool, key);
+            ctx.getExtra().put(ScriptConstants.KEY_LAST_SCRIPT, resolvedKey);
+            LOGGER.info("[EDPA-SCRIPT] {} result fallback resolved={} -> response_template", tool, resolvedKey);
         }
     }
 
@@ -142,6 +149,10 @@ public class ScriptsRail extends DeepAgentRail {
      *
      * <p>call_versatile 是通用工具，推荐/查余额/转账/购买都走它，仅靠 status 无法区分业务。
      * 按 content JSON 中的业务字段（productList / productBuyResponse / balance / node_name）细分。</p>
+     *
+     * <p><b>返回 ScriptConstants 常量名</b>（如 {@code "SCRIPT_FUND_PLANNING_SUCCESS"}），
+     * 调用方通过 {@link SysScriptsConfig#hasScript(String)} / {@link SysScriptsConfig#getScriptOrDefault(String, String)}
+     * 做键映射。</p>
      */
     @SuppressWarnings("unchecked")
     private String pickResultScriptKey(String tool, Object toolResult) {
@@ -166,8 +177,7 @@ public class ScriptsRail extends DeepAgentRail {
         }
         if (ToolConstants.CALL_VERSATILE.equals(tool)) {
             // 缺参走 ask_user 话术，不在此兜底
-            if (ScriptConstants.STATUS_MISSING_AMOUNT.equalsIgnoreCase(status)
-                    || ScriptConstants.STATUS_MISSING_PRODUCT.equalsIgnoreCase(status)) {
+            if ("missing_amount".equalsIgnoreCase(status) || "missing_product".equalsIgnoreCase(status)) {
                 return null;
             }
             // 解析 content JSON 中的业务字段
@@ -178,13 +188,13 @@ public class ScriptsRail extends DeepAgentRail {
                 if (buyResp instanceof Map<?, ?> br) {
                     String buyStatus = br.get("buyStatus") == null ? null : String.valueOf(br.get("buyStatus"));
                     if ("1".equals(buyStatus)) {
-                        return ScriptConstants.SCRIPT_FUND_PLANNING_SUCCESS;
+                        return "SCRIPT_FUND_PLANNING_SUCCESS";
                     }
-                    return ScriptConstants.SCRIPT_FUND_PLANNING_FAILED;
+                    return "SCRIPT_FUND_PLANNING_FAILED";
                 }
                 // 推荐理财：productList
                 if (contentJson.containsKey("productList")) {
-                    return ScriptConstants.SCRIPT_PRODUCT_RECOMMEND_SUCCESS;
+                    return "SCRIPT_PRODUCT_RECOMMEND_SUCCESS";
                 }
                 // 查余额 / 转账：无对应话术，不兜底
                 if (contentJson.containsKey("balance") || contentJson.containsKey("node_name")) {
@@ -193,15 +203,15 @@ public class ScriptsRail extends DeepAgentRail {
             }
             // status 非 success/completed 但非空 → failed
             if (status != null
-                    && !ScriptConstants.RESULT_SUCCESS.equalsIgnoreCase(status)
-                    && !ScriptConstants.RESULT_COMPLETED.equalsIgnoreCase(status)) {
-                return ScriptConstants.SCRIPT_FUND_PLANNING_FAILED;
+                    && !"success".equalsIgnoreCase(status)
+                    && !"completed".equalsIgnoreCase(status)) {
+                return "SCRIPT_FUND_PLANNING_FAILED";
             }
             // 未知业务，不兜底
             return null;
         }
         if (ToolConstants.CALL_MCP.equals(tool)) {
-            return ScriptConstants.SCRIPT_MCP_RESULT_EMPTY;
+            return "SCRIPT_MCP_RESULT_EMPTY";
         }
         return null;
     }
@@ -243,14 +253,18 @@ public class ScriptsRail extends DeepAgentRail {
 
     /**
      * 合规把关：配置外话术（{@code _edp_last_script_key} 不在配置内）→ 替换为 {@code out_of_scope}。
+     *
+     * <p>注意：{@code _edp_last_script_key} 存储的是解析后的实际键名（非常量名），
+     * 所以此处使用 {@link SysScriptsConfig#has(String)} 而非 {@link SysScriptsConfig#hasScript(String)}。</p>
      */
     private void complianceGate(AgentCallbackContext ctx) {
         Object k = ctx.getExtra().get(ScriptConstants.KEY_LAST_SCRIPT);
-        String key = k == null ? null : String.valueOf(k);
-        if (scripts != null && key != null && !scripts.has(key)) {
+        String resolvedKey = k == null ? null : String.valueOf(k);
+        if (scripts != null && resolvedKey != null && !scripts.has(resolvedKey)) {
+            // _edp_last_script_key 存的是实际键名，直接查 has()
             ctx.getExtra().put(ScriptConstants.KEY_RESPONSE_TEMPLATE,
-                    scripts.getOrDefault(ScriptConstants.SCRIPT_OUT_OF_SCOPE, ""));
-            LOGGER.info("[EDPA-SCRIPT] compliance gate replaced out-of-config key={} -> out_of_scope", key);
+                    scripts.getScriptOrDefault("SCRIPT_OUT_OF_SCOPE", ""));
+            LOGGER.info("[EDPA-SCRIPT] compliance gate replaced out-of-config key={} -> out_of_scope", resolvedKey);
         }
     }
 

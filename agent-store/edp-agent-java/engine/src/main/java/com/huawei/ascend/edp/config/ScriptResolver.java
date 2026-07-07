@@ -351,6 +351,8 @@ public final class ScriptResolver {
     /**
      * 生成 cancel 规则 Prompt 段：告知 LLM 调 {@code cancel_task} 时 {@code reason} 取值。
      *
+     * <p>使用配置驱动的键映射，展示配置中实际存在的键名。</p>
+     *
      * @param scripts 话术配置，null 返回空串
      * @return Prompt 文本
      */
@@ -360,14 +362,16 @@ public final class ScriptResolver {
         }
         StringBuilder sb = new StringBuilder("## 取消/超范围话术规则\n");
         sb.append("调用 cancel_task 时 reason 须取以下值之一（对应配置内话术）：");
-        appendKey(sb, scripts, ScriptConstants.SCRIPT_TASK_CANCELLED, "取消任务");
-        appendKey(sb, scripts, ScriptConstants.SCRIPT_CANCEL_CONFIRM, "取消确认");
-        appendKey(sb, scripts, ScriptConstants.SCRIPT_OUT_OF_SCOPE, "超范围");
+        appendScriptKey(sb, scripts, "task_cancelled", "取消任务");
+        appendScriptKey(sb, scripts, "cancel_confirm", "取消确认");
+        appendScriptKey(sb, scripts, "out_of_scope", "超范围");
         return sb.toString();
     }
 
     /**
      * 生成业务规则 Prompt 段：告知 LLM {@code ask_user} 的 status→key 映射与需补 vars。
+     *
+     * <p>使用配置驱动的键映射，展示配置中实际存在的键名。</p>
      *
      * @param scripts 话术配置，null 返回空串
      * @return Prompt 文本
@@ -378,18 +382,37 @@ public final class ScriptResolver {
         }
         StringBuilder sb = new StringBuilder("## 业务话术规则\n");
         sb.append("ask_user 通过 response_template_status + response_template_keys + response_template_vars 选话术：");
-        appendKey(sb, scripts, ScriptConstants.SCRIPT_PRODUCT_SELECT_CONFIRM, "选品确认（vars: productName, amount）");
-        appendKey(sb, scripts, ScriptConstants.SCRIPT_PRODUCT_SELECT_MISSING_AMOUNT, "缺金额");
-        appendKey(sb, scripts, ScriptConstants.SCRIPT_PRODUCT_SELECT_MISSING_PRODUCT, "缺产品");
-        appendKey(sb, scripts, ScriptConstants.SCRIPT_FUND_PLANNING_SUCCESS, "购买成功（vars: orderId）");
-        appendKey(sb, scripts, ScriptConstants.SCRIPT_MCP_RESULT_EMPTY, "MCP 空结果");
+        appendScriptKey(sb, scripts, "product_select_confirm", "选品确认（vars: productName, amount）");
+        appendScriptKey(sb, scripts, "product_select_missing_amount", "缺金额");
+        appendScriptKey(sb, scripts, "product_select_missing_product", "缺产品");
+        appendScriptKey(sb, scripts, "fund_planning_success", "购买成功（vars: orderId）");
+        appendScriptKey(sb, scripts, "mcp_result_empty", "MCP 空结果");
         return sb.toString();
     }
 
-    private static void appendKey(StringBuilder sb, SysScriptsConfig cfg, String key, String desc) {
-        if (cfg != null && cfg.has(key)) {
-            sb.append("\n- ").append(key).append("（").append(desc).append("）");
+    /**
+     * 按话术常量名追加到 Prompt StringBuilder。
+     *
+     * <p>内部通过 {@link SysScriptsConfig#hasScript(String)} 检查话术是否存在，
+     * 存在时追加配置中的实际键名（而非常量名）。</p>
+     *
+     * @param sb   StringBuilder
+     * @param cfg  话术配置
+     * @param constantName 常量名（如 "task_cancelled"，不含 SCRIPT_ 前缀）
+     * @param desc 描述文本
+     */
+    private static void appendScriptKey(StringBuilder sb, SysScriptsConfig cfg, 
+            String constantName, String desc) {
+        if (cfg == null || constantName == null) {
+            return;
         }
+        // 检查话术是否存在（SCRIPT_ 前缀在 hasScript 内部处理）
+        if (!cfg.hasScript("SCRIPT_" + constantName.toUpperCase().replace("-", "_"))) {
+            return;
+        }
+        // 获取配置中的实际键名
+        String resolvedKey = cfg.resolveScriptKey("SCRIPT_" + constantName.toUpperCase().replace("-", "_"));
+        sb.append("\n- ").append(resolvedKey).append("（").append(desc).append("）");
     }
 
     // ═══════════════════════════════════════════════════
@@ -403,7 +426,12 @@ public final class ScriptResolver {
      * 而非 {@code beforeToolCall}（p=80 被 {@code AskUserTemplateRail}(85) 抛异常中断，不可达）。
      * 解析与 {@code interrupt_start} 发射在同一回调，无时序竞态。</p>
      *
-     * <p>配置缺位 / 无话术参数 → 返回 false（不写 extra），调用方回落 {@link #interruptStart} 兜底文案。</p>
+     * <p><b>键映射说明</b>：
+     * <ul>
+     *   <li>LLM 通过 Prompt 获知配置中的话术键名，填充 {@code response_template_keys}</li>
+     *   <li>此处 key 是配置中的实际键名，直接用 {@link SysScriptsConfig#has(String)} 校验</li>
+     *   <li>status 值（如 "confirm"）直接与字符串常量比较，绕过 ScriptConstants</li>
+     * </ul>
      *
      * @param scripts 话术配置
      * @param rawArgs ask_user 工具原始入参（Map 或 JSON 字符串）
@@ -418,8 +446,9 @@ public final class ScriptResolver {
         if (args.isEmpty()) {
             return false;
         }
-        String status = str(args.get(ScriptConstants.PARAM_RESPONSE_TEMPLATE_STATUS));
-        Map<String, String> keys = coerceJsonMap(args.get(ScriptConstants.PARAM_RESPONSE_TEMPLATE_KEYS));
+        // status 是配置中的键名（如 "confirm"），不是 ScriptConstants 常量
+        String status = str(args.get("response_template_status"));
+        Map<String, String> keys = coerceJsonMap(args.get("response_template_keys"));
         if (keys.isEmpty() || isBlank(status)) {
             return false; // 无话术参数放行
         }
@@ -427,10 +456,11 @@ public final class ScriptResolver {
         if (isBlank(key) || !scripts.has(key)) {
             return false; // 配置缺位放行
         }
-        Map<String, String> vars = coerceJsonMap(args.get(ScriptConstants.PARAM_RESPONSE_TEMPLATE_VARS));
+        Map<String, String> vars = coerceJsonMap(args.get("response_template_vars"));
         extra.put(ScriptConstants.KEY_RESPONSE_TEMPLATE, resolve(scripts, key, vars));
         extra.put(ScriptConstants.KEY_LAST_SCRIPT, key);
-        if (ScriptConstants.STATUS_CONFIRM.equals(status)) {
+        // status "confirm" 是配置中的键名，不是 ScriptConstants 常量
+        if ("confirm".equalsIgnoreCase(status)) {
             extra.put(ScriptConstants.KEY_SELECTED_PRODUCT, vars);
         }
         return true;

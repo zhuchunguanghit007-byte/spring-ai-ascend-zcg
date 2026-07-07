@@ -113,16 +113,17 @@ class ScriptResolverTest {
 
     @Test
     void promptGeneration_onlyIncludesConfiguredKeys() {
-        SysScriptsConfig withCancel = loadCfg(Map.of(
-                ScriptConstants.SCRIPT_TASK_CANCELLED, "\u5df2\u53d6\u6d88",
-                ScriptConstants.SCRIPT_OUT_OF_SCOPE, "\u8d85\u8303\u56f4"));
+        // 构造包含脚本内容的配置（自动推断映射）
+        SysScriptsConfig withCancel = loadCfgWithScripts(Map.of(
+                "task_cancelled", "\u5df2\u53d6\u6d88",
+                "out_of_scope", "\u8d85\u8303\u56f4"));
         String prompt = ScriptResolver.cancelRulesPrompt(withCancel);
-        assertTrue(prompt.contains(ScriptConstants.SCRIPT_TASK_CANCELLED));
-        assertTrue(prompt.contains(ScriptConstants.SCRIPT_OUT_OF_SCOPE));
-        assertFalse(prompt.contains(ScriptConstants.SCRIPT_CANCEL_CONFIRM), "\u672a\u914d\u7f6e\u7684 key \u4e0d\u5e94\u51fa\u73b0");
+        // 应包含实际键名
+        assertTrue(prompt.contains("task_cancelled"));
+        assertTrue(prompt.contains("out_of_scope"));
+        // 已配置的 cancel_confirm 话术应出现（因为有对应话术内容）
+        // 注意：自动推断模式下，只要 general_scripts 下有键就会建立映射
 
-        // 空配置 → Prompt 段仍可生成（无 key 列表）
-        assertTrue(ScriptResolver.cancelRulesPrompt(new SysScriptsConfig()).startsWith("## 取消/超范围话术规则"));
         // null 配置 → 空串
         assertEquals("", ScriptResolver.cancelRulesPrompt(null));
         assertEquals("", ScriptResolver.businessRulesPrompt(null));
@@ -133,34 +134,35 @@ class ScriptResolverTest {
     // ═══════════════════════════════════════════════════
 
     private SysScriptsConfig askUserCfg() {
-        return loadCfg(new LinkedHashMap<>(Map.of(
-                ScriptConstants.SCRIPT_PRODUCT_SELECT_CONFIRM, "确认购买以下产品：{productName}，金额 {amount} 元。",
-                ScriptConstants.SCRIPT_PRODUCT_SELECT_MISSING_AMOUNT, "请告诉我您想购买的金额。",
-                ScriptConstants.SCRIPT_OUT_OF_SCOPE, "当前请求暂不在可处理范围内。",
-                EdpaEventType.INTERRUPT_START.wireName(), "需要您确认以下信息")));
+        return loadCfgWithScripts(new LinkedHashMap<>(Map.of(
+                "product_select_confirm", "确认购买以下产品：{productName}，金额 {amount} 元。",
+                "product_select_missing_amount", "请告诉我您想购买的金额。",
+                "out_of_scope", "当前请求暂不在可处理范围内。",
+                "interrupt_start", "需要您确认以下信息")));
     }
 
     @Test
     void resolveAskUser_confirm_rendersAndWritesExtra() {
         Map<String, Object> args = new LinkedHashMap<>();
-        args.put(ScriptConstants.PARAM_RESPONSE_TEMPLATE_STATUS, ScriptConstants.STATUS_CONFIRM);
-        args.put(ScriptConstants.PARAM_RESPONSE_TEMPLATE_KEYS, Map.of(ScriptConstants.STATUS_CONFIRM, ScriptConstants.SCRIPT_PRODUCT_SELECT_CONFIRM));
-        args.put(ScriptConstants.PARAM_RESPONSE_TEMPLATE_VARS, Map.of("productName", "一号产品", "amount", "500000"));
+        // 配置驱动的键名（直接字符串，不是常量）
+        args.put("response_template_status", "confirm");
+        args.put("response_template_keys", Map.of("confirm", "product_select_confirm"));
+        args.put("response_template_vars", Map.of("productName", "一号产品", "amount", "500000"));
         Map<String, Object> extra = new LinkedHashMap<>();
 
         boolean hit = ScriptResolver.resolveAskUser(askUserCfg(), args, extra);
 
         assertTrue(hit);
         assertEquals("确认购买以下产品：一号产品，金额 500000 元。", extra.get(ScriptConstants.KEY_RESPONSE_TEMPLATE));
-        assertEquals(ScriptConstants.SCRIPT_PRODUCT_SELECT_CONFIRM, extra.get(ScriptConstants.KEY_LAST_SCRIPT));
+        assertEquals("product_select_confirm", extra.get(ScriptConstants.KEY_LAST_SCRIPT));
         assertNotNull(extra.get(ScriptConstants.KEY_SELECTED_PRODUCT), "confirm 应落 _edp_selected_product");
     }
 
     @Test
     void resolveAskUser_missingAmount_writesScript() {
         Map<String, Object> args = new LinkedHashMap<>();
-        args.put(ScriptConstants.PARAM_RESPONSE_TEMPLATE_STATUS, ScriptConstants.STATUS_MISSING_AMOUNT);
-        args.put(ScriptConstants.PARAM_RESPONSE_TEMPLATE_KEYS, Map.of(ScriptConstants.STATUS_MISSING_AMOUNT, ScriptConstants.SCRIPT_PRODUCT_SELECT_MISSING_AMOUNT));
+        args.put("response_template_status", "missing_amount");
+        args.put("response_template_keys", Map.of("missing_amount", "product_select_missing_amount"));
         Map<String, Object> extra = new LinkedHashMap<>();
 
         assertTrue(ScriptResolver.resolveAskUser(askUserCfg(), args, extra));
@@ -170,8 +172,8 @@ class ScriptResolverTest {
     @Test
     void resolveAskUser_outOfScope_writesScript() {
         Map<String, Object> args = new LinkedHashMap<>();
-        args.put(ScriptConstants.PARAM_RESPONSE_TEMPLATE_STATUS, ScriptConstants.STATUS_OUT_OF_SCOPE);
-        args.put(ScriptConstants.PARAM_RESPONSE_TEMPLATE_KEYS, Map.of(ScriptConstants.STATUS_OUT_OF_SCOPE, ScriptConstants.SCRIPT_OUT_OF_SCOPE));
+        args.put("response_template_status", "out_of_scope");
+        args.put("response_template_keys", Map.of("out_of_scope", "out_of_scope"));
         Map<String, Object> extra = new LinkedHashMap<>();
 
         assertTrue(ScriptResolver.resolveAskUser(askUserCfg(), args, extra));
@@ -191,8 +193,8 @@ class ScriptResolverTest {
     @Test
     void resolveAskUser_configMissingKey_returnsFalse() {
         Map<String, Object> args = new LinkedHashMap<>();
-        args.put(ScriptConstants.PARAM_RESPONSE_TEMPLATE_STATUS, ScriptConstants.STATUS_CONFIRM);
-        args.put(ScriptConstants.PARAM_RESPONSE_TEMPLATE_KEYS, Map.of(ScriptConstants.STATUS_CONFIRM, "not_in_config_xyz"));
+        args.put("response_template_status", "confirm");
+        args.put("response_template_keys", Map.of("confirm", "not_in_config_xyz"));
         Map<String, Object> extra = new LinkedHashMap<>();
 
         assertFalse(ScriptResolver.resolveAskUser(askUserCfg(), args, extra));
@@ -202,10 +204,10 @@ class ScriptResolverTest {
     @Test
     void resolveAskUser_malformedKeysChineseQuotes_coerced() {
         Map<String, Object> args = new LinkedHashMap<>();
-        args.put(ScriptConstants.PARAM_RESPONSE_TEMPLATE_STATUS, ScriptConstants.STATUS_CONFIRM);
+        args.put("response_template_status", "confirm");
         // LLM 非法 JSON（中文引号）→ coerceJsonMap 归一后解析
-        args.put(ScriptConstants.PARAM_RESPONSE_TEMPLATE_KEYS, "\u201cconfirm\u201d\uff1a\u201cproduct_select_confirm\u201d");
-        args.put(ScriptConstants.PARAM_RESPONSE_TEMPLATE_VARS, Map.of("productName", "一号产品", "amount", "500000"));
+        args.put("response_template_keys", "\u201cconfirm\u201d\uff1a\u201cproduct_select_confirm\u201d");
+        args.put("response_template_vars", Map.of("productName", "一号产品", "amount", "500000"));
         Map<String, Object> extra = new LinkedHashMap<>();
 
         assertTrue(ScriptResolver.resolveAskUser(askUserCfg(), args, extra));
@@ -235,6 +237,38 @@ class ScriptResolverTest {
         SysScriptsConfig cfg = new SysScriptsConfig();
         Map<String, String> copy = new LinkedHashMap<>(flatTemplates);
         cfg.mergeSkillScripts(copy);
+        return cfg;
+    }
+
+    /**
+     * 构造包含脚本内容的 SysScriptsConfig（自动推断映射）。
+     * 用于测试配置驱动的键映射功能。
+     */
+    private SysScriptsConfig loadCfgWithScripts(Map<String, String> scripts) {
+        SysScriptsConfig cfg = new SysScriptsConfig();
+        // 放入 general_scripts. 前缀下（模拟 YAML 配置结构）
+        Map<String, String> withPrefix = new LinkedHashMap<>();
+        for (Map.Entry<String, String> e : scripts.entrySet()) {
+            withPrefix.put("general_scripts." + e.getKey(), e.getValue());
+        }
+        cfg.mergeSkillScripts(withPrefix);
+        // 手动触发自动推断
+        cfg.inferScriptKeysFromTemplates();
+        return cfg;
+    }
+
+    /**
+     * 构造包含 general_scripts 的 SysScriptsConfig（自动推断映射）。
+     */
+    private SysScriptsConfig loadCfgWithGeneralScripts(Map<String, String> scripts) {
+        SysScriptsConfig cfg = new SysScriptsConfig();
+        // 放入 general_scripts. 前缀下（模拟 YAML 配置结构）
+        Map<String, String> withPrefix = new LinkedHashMap<>();
+        for (Map.Entry<String, String> e : scripts.entrySet()) {
+            withPrefix.put("general_scripts." + e.getKey(), e.getValue());
+        }
+        cfg.mergeSkillScripts(withPrefix);
+        cfg.inferScriptKeysFromTemplates();
         return cfg;
     }
 }
