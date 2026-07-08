@@ -53,7 +53,22 @@ public class ScriptsRail extends DeepAgentRail {
     /** 话术配置，可为 null（退化为不填话术，等价现状）。 */
     private final SysScriptsConfig scripts;
 
+    /**
+     * 构造话术 Rail。
+     *
+     * @param scripts 话术配置
+     */
     public ScriptsRail(SysScriptsConfig scripts) {
+        this.scripts = scripts;
+    }
+
+    /**
+     * 构造话术 Rail（兼容含 edpConfig 的调用）。
+     *
+     * @param scripts 话术配置
+     * @param edpConfig EDP 配置（UC-C04 scope 已通过 PlanrulePromptBuilder 注入 prompt，此处不使用）
+     */
+    public ScriptsRail(SysScriptsConfig scripts, com.huawei.ascend.edp.config.EdpConfig edpConfig) {
         this.scripts = scripts;
     }
 
@@ -71,6 +86,8 @@ public class ScriptsRail extends DeepAgentRail {
         // request_start 不作为独立事件发射（对齐 Python 理念）。
         // 首轮开场感知由 conversation_start 承载；出口话术通过 conversation_end content 输出。
         // planning 阶段提示由 think_chunk 固定帧话术承载。
+        // UC-C04: 超范围检测由 LLM 通过 prompt 中的 scope.allowed/denied 自行判断（对齐 Python prompt.py），
+        // complianceGate 兜底确保配置外话术被替换为 out_of_scope。
     }
 
     // ═══════════════════════════════════════════════════
@@ -122,118 +139,8 @@ public class ScriptsRail extends DeepAgentRail {
     // ═══════════════════════════════════════════════════
     @Override
     public void afterToolCall(AgentCallbackContext ctx) {
-        if (scripts == null || !(ctx.getInputs() instanceof ToolCallInputs inputs)) {
-            return;
-        }
-        if (readResponseTemplate(ctx) != null) {
-            return; // 已写不兜底
-        }
-        String tool = inputs.getToolName();
-        if (!ToolConstants.CALL_VERSATILE.equals(tool) && !ToolConstants.CALL_MCP.equals(tool)) {
-            return;
-        }
-        // pickResultScriptKey 返回 ScriptConstants 常量名，内部通过 hasScript/getScriptOrDefault 做映射
-        String constantName = pickResultScriptKey(tool, inputs.getToolResult());
-        if (isBlank(constantName) || !scripts.hasScript(constantName)) {
-            return; // 配置缺位不补，不触碰 VersatileRail/McpRail 内部逻辑
-        }
-        String text = scripts.getScriptOrDefault(constantName, "");
-        if (!isBlank(text)) {
-            String resolvedKey = scripts.resolveScriptKey(constantName);
-            ctx.getExtra().put(ScriptConstants.KEY_RESPONSE_TEMPLATE, text);
-            ctx.getExtra().put(ScriptConstants.KEY_LAST_SCRIPT, resolvedKey);
-            LOGGER.info("[EDPA-SCRIPT] {} result fallback resolved={} -> response_template", tool, resolvedKey);
-        }
-    }
-
-    /**
-     * 按 tool + result content 业务字段映射结果话术 key（配置缺位返回 null，不兜底）。
-     *
-     * <p>call_versatile 是通用工具，推荐/查余额/转账/购买都走它，仅靠 status 无法区分业务。
-     * 按 content JSON 中的业务字段（productList / productBuyResponse / balance / node_name）细分。</p>
-     *
-     * <p><b>返回 ScriptConstants 常量名</b>（如 {@code "SCRIPT_FUND_PLANNING_SUCCESS"}），
-     * 调用方通过 {@link SysScriptsConfig#hasScript(String)} / {@link SysScriptsConfig#getScriptOrDefault(String, String)}
-     * 做键映射。</p>
-     */
-    @SuppressWarnings("unchecked")
-    private String pickResultScriptKey(String tool, Object toolResult) {
-        Map<String, Object> result = null;
-        String status = null;
-        String content = null;
-        if (toolResult instanceof Map<?, ?> map) {
-            result = (Map<String, Object>) map;
-            status = map.get("status") == null ? null : String.valueOf(map.get("status"));
-            content = map.get("content") == null ? null : String.valueOf(map.get("content"));
-        } else if (toolResult instanceof String s) {
-            try {
-                Object parsed = OBJECT_MAPPER.readValue(s, Object.class);
-                if (parsed instanceof Map<?, ?> m) {
-                    result = (Map<String, Object>) m;
-                    status = m.get("status") == null ? null : String.valueOf(m.get("status"));
-                    content = m.get("content") == null ? null : String.valueOf(m.get("content"));
-                }
-            } catch (Exception ignore) {
-                // 非 JSON，按空处理
-            }
-        }
-        if (ToolConstants.CALL_VERSATILE.equals(tool)) {
-            // 缺参走 ask_user 话术，不在此兜底
-            if ("missing_amount".equalsIgnoreCase(status) || "missing_product".equalsIgnoreCase(status)) {
-                return null;
-            }
-            // 解析 content JSON 中的业务字段
-            Map<String, Object> contentJson = parseContentJson(content);
-            if (contentJson != null) {
-                // 购买：productBuyResponse
-                Object buyResp = contentJson.get("productBuyResponse");
-                if (buyResp instanceof Map<?, ?> br) {
-                    String buyStatus = br.get("buyStatus") == null ? null : String.valueOf(br.get("buyStatus"));
-                    if ("1".equals(buyStatus)) {
-                        return "SCRIPT_FUND_PLANNING_SUCCESS";
-                    }
-                    return "SCRIPT_FUND_PLANNING_FAILED";
-                }
-                // 推荐理财：productList
-                if (contentJson.containsKey("productList")) {
-                    return "SCRIPT_PRODUCT_RECOMMEND_SUCCESS";
-                }
-                // 查余额 / 转账：无对应话术，不兜底
-                if (contentJson.containsKey("balance") || contentJson.containsKey("node_name")) {
-                    return null;
-                }
-            }
-            // status 非 success/completed 但非空 → failed
-            if (status != null
-                    && !"success".equalsIgnoreCase(status)
-                    && !"completed".equalsIgnoreCase(status)) {
-                return "SCRIPT_FUND_PLANNING_FAILED";
-            }
-            // 未知业务，不兜底
-            return null;
-        }
-        if (ToolConstants.CALL_MCP.equals(tool)) {
-            return "SCRIPT_MCP_RESULT_EMPTY";
-        }
-        return null;
-    }
-
-    /** 尝试解析 content 字段为 JSON Map，失败返回 null。 */
-    private Map<String, Object> parseContentJson(String content) {
-        if (content == null || content.isBlank()) {
-            return null;
-        }
-        try {
-            Object parsed = OBJECT_MAPPER.readValue(content, Object.class);
-            if (parsed instanceof Map<?, ?> m) {
-                @SuppressWarnings("unchecked")
-                Map<String, Object> result = (Map<String, Object>) m;
-                return result;
-            }
-        } catch (Exception ignore) {
-            // 非 JSON
-        }
-        return null;
+        // 业务话术键由各 SKILL.yaml scripts 字段定义，通过 SkillScriptsCollector 动态收集。
+        // LLM 通过 ask_user(response_template_keys=["..."]) 指定话术键，不再在此硬编码映射。
     }
 
     // ═══════════════════════════════════════════════════

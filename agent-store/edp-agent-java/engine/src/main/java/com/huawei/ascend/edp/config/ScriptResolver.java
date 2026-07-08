@@ -107,6 +107,32 @@ public final class ScriptResolver {
         return resolve(cfg, EdpaEventType.TOOL_END.wireName(), Map.of("tool_name", safe(tool)));
     }
 
+    /**
+     * 任务级话术匹配：query_intent 精确匹配 → 兜底 {tool_name}。
+     * 对齐 Python execution_limit_rail.py L247-249 和 FEAT_EDPA 话术特性用例文档 L103-104。
+     */
+    public static String toolStart(SysScriptsConfig cfg, String queryIntent, String tool) {
+        if (queryIntent != null && !queryIntent.isBlank() && cfg != null) {
+            String key = "query_intent_tool_text." + queryIntent + ".tool_start";
+            String matched = cfg.getTemplate(key);
+            if (matched != null && !matched.isBlank()) {
+                return matched;
+            }
+        }
+        return resolve(cfg, EdpaEventType.TOOL_START.wireName(), Map.of("tool_name", safe(tool)));
+    }
+
+    public static String toolEnd(SysScriptsConfig cfg, String queryIntent, String tool) {
+        if (queryIntent != null && !queryIntent.isBlank() && cfg != null) {
+            String key = "query_intent_tool_text." + queryIntent + ".tool_end";
+            String matched = cfg.getTemplate(key);
+            if (matched != null && !matched.isBlank()) {
+                return matched;
+            }
+        }
+        return resolve(cfg, EdpaEventType.TOOL_END.wireName(), Map.of("tool_name", safe(tool)));
+    }
+
     public static String todoStart(SysScriptsConfig cfg, String title) {
         return resolve(cfg, EdpaEventType.TODO_START.wireName(), Map.of("title", safe(title)));
     }
@@ -312,6 +338,16 @@ public final class ScriptResolver {
                 map.forEach((k, v) -> out.put(String.valueOf(k), v == null ? "" : String.valueOf(v)));
                 return out;
             }
+            // 1b) 已是 List → Map（每个元素同时作为 key 和 value）
+            if (raw instanceof List<?> listRaw) {
+                for (Object item : listRaw) {
+                    if (item != null) {
+                        String val = String.valueOf(item);
+                        out.put(val, val);
+                    }
+                }
+                return out;
+            }
             String s = String.valueOf(raw).trim();
             if (s.isEmpty()) {
                 return out;
@@ -328,6 +364,16 @@ public final class ScriptResolver {
                 Object parsed = JSON_MAPPER.readValue(s, Object.class);
                 if (parsed instanceof Map<?, ?> map) {
                     map.forEach((k, v) -> out.put(String.valueOf(k), v == null ? "" : String.valueOf(v)));
+                    return out;
+                }
+                // List → Map（每个元素同时作为 key 和 value，支持 LLM 传 ["out_of_scope"] 而非 {"out_of_scope":"out_of_scope"}）
+                if (parsed instanceof List<?> list) {
+                    for (Object item : list) {
+                        if (item != null) {
+                            String val = String.valueOf(item);
+                            out.put(val, val);
+                        }
+                    }
                     return out;
                 }
             } catch (Exception ignore) {
@@ -382,17 +428,15 @@ public final class ScriptResolver {
             return "";
         }
         StringBuilder sb = new StringBuilder("## 业务话术规则\n");
-        sb.append("ask_user 通过 response_template_status + response_template_keys + response_template_vars 选话术：");
-        appendKey(sb, scripts, ScriptConstants.SCRIPT_PRODUCT_SELECT_CONFIRM, "选品确认（vars: productName, amount）");
-        appendKey(sb, scripts, ScriptConstants.SCRIPT_PRODUCT_SELECT_MISSING_AMOUNT, "缺金额");
-        appendKey(sb, scripts, ScriptConstants.SCRIPT_PRODUCT_SELECT_MISSING_PRODUCT, "缺产品");
-        appendKey(sb, scripts, ScriptConstants.SCRIPT_FUND_PLANNING_SUCCESS, "购买成功（vars: orderId）");
-        appendKey(sb, scripts, ScriptConstants.SCRIPT_MCP_RESULT_EMPTY, "MCP 空结果");
-        // UC-C03 两步取消流程：第一步用 ask_user(status=cancel_confirm) 输出取消确认话术，
-        // 第二步用 cancel_task(reason=task_cancelled) 输出取消完成话术。
-        // cancel_confirm 在此列出以引导 LLM 用 ask_user 做取消确认时传对应话术参数，
-        // 避免漏传 status/keys 导致 Rail 走兜底拼接（与配置文案不一致）。
+        sb.append("ask_user 通过 response_template_status + response_template_keys + response_template_vars 选话术。");
+        sb.append("\n可用业务话术键（来自各 SKILL.yaml scripts 字段，动态收集）：");
+        // 动态遍历所有业务话术键（来自 SKILL.yaml，不含通用前缀）
+        for (String key : scripts.listBusinessScriptKeys()) {
+            sb.append("\n- ").append(key);
+        }
+        // 通用话术键（取消确认、超范围等）单独列出
         appendKey(sb, scripts, ScriptConstants.SCRIPT_CANCEL_CONFIRM, "取消确认（两步取消第一步）");
+        appendKey(sb, scripts, ScriptConstants.SCRIPT_OUT_OF_SCOPE, "超范围提示");
         return sb.toString();
     }
 

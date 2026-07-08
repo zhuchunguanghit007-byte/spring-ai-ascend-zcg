@@ -270,7 +270,7 @@ public class EdpaAgentEnhancer {
             rails.add(new EdpaEventRail(deepAgent, scripts, redisTodoStore));
         }
         // 话术出口 Rail（B 面：首轮/业务话术/出口/合规/Prompt）。
-        rails.add(new ScriptsRail(scripts));
+        rails.add(new ScriptsRail(scripts, edpConfig));
 
         return rails;
     }

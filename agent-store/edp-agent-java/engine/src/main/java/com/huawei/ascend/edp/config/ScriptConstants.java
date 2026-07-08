@@ -56,13 +56,8 @@ public final class ScriptConstants {
     public static final String SCRIPT_TASK_CANCELLED = "task_cancelled";
     public static final String SCRIPT_CANCEL_CONFIRM = "cancel_confirm";
     public static final String SCRIPT_OUT_OF_SCOPE = "out_of_scope";
-    public static final String SCRIPT_PRODUCT_SELECT_CONFIRM = "product_select_confirm";
-    public static final String SCRIPT_PRODUCT_SELECT_MISSING_AMOUNT = "product_select_missing_amount";
-    public static final String SCRIPT_PRODUCT_SELECT_MISSING_PRODUCT = "product_select_missing_product";
-    public static final String SCRIPT_PRODUCT_RECOMMEND_SUCCESS = "product_recommend_success";
-    public static final String SCRIPT_FUND_PLANNING_SUCCESS = "fund_planning_success";
-    public static final String SCRIPT_FUND_PLANNING_FAILED = "fund_planning_failed";
-    public static final String SCRIPT_MCP_RESULT_EMPTY = "mcp_result_empty";
+    // 业务话术键（product_select_confirm 等）由各 SKILL.yaml scripts 字段定义，
+    // 通过 SkillScriptsCollector 动态收集到 templates，不再在此硬编码。
 
     // ── ask_user response_template 参数 key（LLM 工具入参字段名）──
 

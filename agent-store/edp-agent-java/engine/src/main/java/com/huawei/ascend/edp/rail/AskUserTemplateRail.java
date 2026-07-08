@@ -99,20 +99,25 @@ public class AskUserTemplateRail extends AgentRail {
 
         // 预解析话术：使 InterruptRequest.message 与 interrupt_start.content 一致，
         // 避免框架 statusUpdate 携带 LLM 原始 question（与 conversation_end 时序冲突）。
-        String interruptMessage = question;
+        // UC-C02: 对齐 Python ask_user_rail.py L172-180: 未命中脚本时用 LLM question 兜底
+        String interruptSource = scripts != null ? scripts.getInterruptSource() : "script";
+        String interruptMessage;
         if (scripts != null) {
             ScriptResolver.resolveAskUser(scripts, args, ctx.getExtra());
             Object rt = ctx.getExtra().get(ScriptConstants.KEY_RESPONSE_TEMPLATE);
             if (rt != null && !String.valueOf(rt).isBlank()) {
+                // 脚本话术命中
                 interruptMessage = String.valueOf(rt);
             } else {
-                // 兜底：无业务话术模板时，保留 LLM 原始 question，
-                // 用 interrupt_start 前缀提示用户"这是系统需要你补充信息"
-                interruptMessage = ScriptResolver.interruptStart(scripts) + "：" + question;
+                // 未命中脚本：用 LLM question 兜底（不丢弃），缺则用 interrupt_start 配置
+                interruptMessage = question.isBlank()
+                        ? ScriptResolver.interruptStart(scripts) : question;
             }
+        } else {
+            interruptMessage = question;
         }
-        LOGGER.info("AskUserTemplateRail: interrupting ask_user tool call, toolCallId={}, message='{}'",
-                toolCallId, interruptMessage);
+        LOGGER.info("AskUserTemplateRail: interrupting ask_user tool call, toolCallId={}, source={}, message='{}'",
+                toolCallId, interruptSource, interruptMessage);
 
         InterruptRequest request = InterruptRequest.builder()
                 .interruptId(toolCallId)

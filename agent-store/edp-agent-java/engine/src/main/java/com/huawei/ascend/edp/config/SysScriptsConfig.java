@@ -61,6 +61,12 @@ public class SysScriptsConfig {
     /** query_patterns 配置结构（解析后缓存）。 */
     private List<QueryPattern> queryPatterns = null;
 
+    /** 每次 load() 时独立解析的 query_patterns 源列表（用于框架级+场景级合并）。 */
+    private final List<List<QueryPattern>> queryPatternsSources = new ArrayList<>();
+
+    /** interrupt 追问内容来源开关：script（默认，必须脚本）或 llm（允许 LLM 生成）。UC-C02 */
+    private String interruptSource = "script";
+
     /** 标记是否已加载场景配置。 */
     private boolean loaded = false;
 
@@ -119,6 +125,8 @@ public class SysScriptsConfig {
                 try (InputStream is = cl.getResourceAsStream(resourcePath)) {
                     if (is != null) {
                         Map<String, Object> parsed = YAML_MAPPER.readValue(is, Map.class);
+                        collectQueryPatternsSource(parsed);
+                        parseInterruptSource(parsed);
                         flatten("", parsed);
                         aliasCommonKeys();
                         aliasGovernancePrefixes();
@@ -165,14 +173,16 @@ public class SysScriptsConfig {
 
     private void loadFromFile(Path path) throws Exception {
         Map<String, Object> parsed = YAML_MAPPER.readValue(Files.readString(path), Map.class);
+        collectQueryPatternsSource(parsed);
+        parseInterruptSource(parsed);
         flatten("", parsed);
         aliasCommonKeys();
         aliasGovernancePrefixes();
         // 自动推断话术键映射
         inferScriptKeys(templates, scriptKeysMap);
         loaded = true;
-        LOGGER.info("SysScriptsConfig loaded from {}, templates={}, scriptKeys={}", 
-                path, templates.size(), scriptKeysMap.size());
+        LOGGER.info("SysScriptsConfig loaded from {}, templates={}, scriptKeys={}, interruptSource={}",
+                path, templates.size(), scriptKeysMap.size(), interruptSource);
     }
 
     /**
@@ -314,6 +324,20 @@ public class SysScriptsConfig {
     }
 
     /**
+     * 动态收集业务话术键（来自各 SKILL.yaml 的 scripts 字段，由 SkillScriptsCollector 合并）。
+     * 业务键 = templates 中不含 "." 的键（如 product_select_confirm），排除通用前缀键（如 general_scripts.xxx）。
+     */
+    public List<String> listBusinessScriptKeys() {
+        List<String> keys = new ArrayList<>();
+        for (String key : templates.keySet()) {
+            if (!key.contains(".") && !key.startsWith("think_chunk") && !key.startsWith("query_patterns")) {
+                keys.add(key);
+            }
+        }
+        return keys;
+    }
+
+    /**
      * 获取当前话术键映射表（调试用）。
      *
      * @return 不可变的映射表副本
@@ -427,7 +451,17 @@ public class SysScriptsConfig {
     // ═══════════════════════════════════════════════════
 
     /**
+     * 获取 interrupt 追问内容来源开关（UC-C02）。
+     * @return "script"（默认，追问内容必须来自脚本）或 "llm"（允许 LLM 生成）
+     */
+    public String getInterruptSource() {
+        return interruptSource;
+    }
+
+    /**
      * 获取 query_patterns 配置（解析后缓存）。
+     * 支持场景级与框架级合并：同 keywords 组时场景级覆盖框架级，不同 keywords 组各自生效。
+     * 对齐 FEAT_EDPA 话术特性用例文档 UC-B02 A5 验收5/6。
      */
     public List<QueryPattern> getQueryPatterns() {
         if (queryPatterns != null) {
@@ -435,22 +469,32 @@ public class SysScriptsConfig {
         }
         queryPatterns = new ArrayList<>();
 
-        // 查找 query_patterns 的 key
-        String qpKey = null;
-        for (Map.Entry<String, String> e : templates.entrySet()) {
-            if (e.getKey().endsWith("query_patterns")) {
-                qpKey = e.getKey();
-                break;
-            }
-        }
-
-        if (qpKey == null) {
+        if (queryPatternsSources.isEmpty()) {
             LOGGER.info("SysScriptsConfig no query_patterns config found");
             return queryPatterns;
         }
 
-        String prefix = qpKey.substring(0, qpKey.length() - "query_patterns".length());
+        // 按 keywords 组为单位合并：同 keywords 组时后加载的覆盖先加载的
+        Map<String, QueryPattern> mergedByKeywords = new LinkedHashMap<>();
+        for (List<QueryPattern> source : queryPatternsSources) {
+            for (QueryPattern qp : source) {
+                String groupKey = String.join(",", qp.keywords);
+                mergedByKeywords.put(groupKey, qp);
+            }
+        }
 
+        queryPatterns = new ArrayList<>(mergedByKeywords.values());
+        LOGGER.info("SysScriptsConfig merged query_patterns: {} entries (from {} sources)",
+                queryPatterns.size(), queryPatternsSources.size());
+        return queryPatterns;
+    }
+
+    /**
+     * 从指定前缀解析 query_patterns 配置。
+     */
+    @SuppressWarnings("unchecked")
+    private List<QueryPattern> parseQueryPatternsFromPrefix(String prefix) {
+        List<QueryPattern> result = new ArrayList<>();
         try {
             Map<String, String> qpEntries = new LinkedHashMap<>();
             for (Map.Entry<String, String> e : templates.entrySet()) {
@@ -511,18 +555,16 @@ public class SysScriptsConfig {
                                 scrs.add(String.valueOf(scr));
                             }
                             if (!kws.isEmpty() && !scrs.isEmpty()) {
-                                queryPatterns.add(new QueryPattern(kws, scrs));
+                                result.add(new QueryPattern(kws, scrs));
                             }
                         }
                     }
                 }
             }
         } catch (Exception e) {
-            LOGGER.warn("Failed to parse query_patterns: {}", e.getMessage());
+            LOGGER.warn("Failed to parse query_patterns from prefix {}: {}", prefix, e.getMessage());
         }
-
-        LOGGER.info("SysScriptsConfig parsed query_patterns: {} entries", queryPatterns.size());
-        return queryPatterns;
+        return result;
     }
 
     /**
@@ -575,6 +617,68 @@ public class SysScriptsConfig {
         }
     }
 
+    /**
+     * 从原始 YAML 解析结果中收集 query_patterns（在 flatten 覆盖前调用）。
+     * 对齐 UC-B02 A5：场景级同 keywords 组覆盖框架级，不同 keywords 组各自生效。
+     */
+    @SuppressWarnings("unchecked")
+    private void collectQueryPatternsSource(Map<String, Object> parsed) {
+        if (parsed == null) return;
+        Object scriptsObj = parsed.get("scriptconfig");
+        if (!(scriptsObj instanceof Map<?, ?>)) return;
+        Object thinkChunkObj = ((Map<String, Object>) scriptsObj).get("think_chunk_scripts");
+        if (!(thinkChunkObj instanceof Map<?, ?>)) return;
+        Object fixedObj = ((Map<String, Object>) thinkChunkObj).get("think_chunk_fixed_scripts");
+        if (!(fixedObj instanceof Map<?, ?>)) return;
+        Object qpObj = ((Map<String, Object>) fixedObj).get("query_patterns");
+        if (!(qpObj instanceof List<?>)) return;
+
+        List<QueryPattern> source = new ArrayList<>();
+        for (Object item : (List<?>) qpObj) {
+            if (item instanceof Map<?, ?> itemMap) {
+                Object kwObj = itemMap.get("keywords");
+                Object scriptsListObj = itemMap.get("scripts");
+                if (kwObj instanceof List<?> keywords && scriptsListObj instanceof List<?> scripts) {
+                    List<String> kws = new ArrayList<>();
+                    for (Object kw : keywords) {
+                        kws.add(String.valueOf(kw));
+                    }
+                    List<String> scrs = new ArrayList<>();
+                    for (Object scr : scripts) {
+                        scrs.add(String.valueOf(scr));
+                    }
+                    if (!kws.isEmpty() && !scrs.isEmpty()) {
+                        source.add(new QueryPattern(kws, scrs));
+                    }
+                }
+            }
+        }
+        if (!source.isEmpty()) {
+            queryPatternsSources.add(source);
+            LOGGER.info("SysScriptsConfig collected query_patterns source: {} entries", source.size());
+        }
+    }
+
+    /**
+     * 解析 interrupt_source 开关（UC-C02）。
+     * 配置位置：scriptconfig.interrupt_source，可选值 "script"（默认）/ "llm"。
+     * 后加载的配置覆盖先加载的（场景级覆盖框架级）。
+     */
+    @SuppressWarnings("unchecked")
+    private void parseInterruptSource(Map<String, Object> parsed) {
+        if (parsed == null) return;
+        Object scriptsObj = parsed.get("scriptconfig");
+        if (!(scriptsObj instanceof Map<?, ?>)) return;
+        Object isObj = ((Map<String, Object>) scriptsObj).get("interrupt_source");
+        if (isObj instanceof String s && !s.isBlank()) {
+            String val = s.trim().toLowerCase();
+            if ("script".equals(val) || "llm".equals(val)) {
+                interruptSource = val;
+                LOGGER.info("SysScriptsConfig interrupt_source={}", val);
+            }
+        }
+    }
+
     private String joinList(List<?> values) {
         return values.stream()
                 .map(String::valueOf)
@@ -608,6 +712,14 @@ public class SysScriptsConfig {
             if (e.getKey().startsWith(qiPrefix)) {
                 String shortKey = e.getKey().substring(qiPrefix.length());
                 aliases.put("query_intent_tool_text." + shortKey, e.getValue());
+            }
+        }
+        // UC-C02: ask_user_confirm 键别名（使 SKILL.md 中的 response_template_keys 值可直接查找）
+        String aucPrefix = "scriptconfig.ask_user_confirm.";
+        for (Map.Entry<String, String> e : templates.entrySet()) {
+            if (e.getKey().startsWith(aucPrefix)) {
+                String shortKey = e.getKey().substring(aucPrefix.length());
+                aliases.put(shortKey, e.getValue());
             }
         }
         templates.putAll(aliases);

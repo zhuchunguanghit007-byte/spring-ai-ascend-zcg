@@ -36,6 +36,14 @@ planrule:
       优先使用理财场景预定义的 catalog_id：
         todo_create({ tasks: [ {catalog_id:\"product_recommend\"}, {catalog_id:\"product_select\"} ] })
 
+      ### 超范围处理规则
+      当用户请求不在 scope.allowed 允许的业务范围内时（如订机票、买保险等）：
+      1. 不要自行回答或解释原因
+      2. 必须调用 ask_user 工具，传入以下参数：
+         - response_template_keys=[\"out_of_scope\"]
+         - response_template_status=\"out_of_scope\"
+      3. 运行时将自动输出超范围提示话术并结束当前对话
+
   # Skill路由规则（继承式覆盖框架默认值，框架默认无值）
   skill_routing:
     - trigger: "用户首次请求推荐理财产品"

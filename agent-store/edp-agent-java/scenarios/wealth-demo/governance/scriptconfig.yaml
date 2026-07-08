@@ -4,6 +4,11 @@
 # 话术键映射自动推断，无需显式声明
 
 scriptconfig:
+  # ── UC-C02: interrupt 追问内容来源开关 ──
+  # script（默认）：追问内容必须来自脚本，LLM 生成内容被拒绝
+  # llm：追问内容可由 LLM 生成
+  interrupt_source: "script"
+
   # ── 生命周期事件话术（EdpaEventRail 发射时填充）──
   general_scripts:
     tool_start: "正在调用：{tool_name}"
@@ -18,15 +23,6 @@ scriptconfig:
     task_cancelled: "好的，已为您取消当前操作。如需其他帮助，请随时告诉我。"
     cancel_confirm: "确认要取消当前操作吗？"
     out_of_scope: "当前请求暂不在可处理范围内。"
-
-  # ── 业务话术模板 ──
-  product_select_confirm: "确认购买以下产品：{productName}，金额 {amount} 元。"
-  product_select_missing_amount: "请告诉我您想购买的金额。"
-  product_select_missing_product: "请问您想购买哪款理财产品？"
-  product_recommend_success: "已为您找到合适的理财产品。"
-  fund_planning_success: "理财购买已成功完成，订单号：{orderId}。"
-  fund_planning_failed: "理财购买未成功，请稍后重试。"
-  mcp_result_empty: "未查询到相关结果。"
 
   # ── 工具级话术匹配模板 ──
   query_intent_tool_text:
@@ -72,7 +68,6 @@ scriptconfig:
       
       enable_resume_scripts: false
 
-  # ── ask_user 中断确认话术 ──
-  ask_user_confirm:
-    purchase_confirm: "确认购买以下产品：{product_name}，金额 {amount} 元。"
-    cancel_confirm: "取消当前购买操作。"
+  # ── ask_user 中断确认话术（UC-C02: interrupt_source=script 时追问内容来源）──
+  # 业务话术已迁移至各 SKILL.yaml 的 scripts 字段，由 SkillScriptsCollector 收集
+  # 此处仅保留场景级覆盖（如需覆盖 SKILL.yaml 中的话术，在此声明同名键）

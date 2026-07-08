@@ -10,6 +10,7 @@ import com.huawei.ascend.edp.enhancer.TodoSessionResolver;
 import com.huawei.ascend.edp.todo.RedisTodoStore;
 import com.openjiuwen.core.foundation.llm.schema.AssistantMessage;
 import com.openjiuwen.core.foundation.llm.schema.ToolCall;
+import com.openjiuwen.core.foundation.llm.schema.UserMessage;
 import com.openjiuwen.core.singleagent.rail.AgentCallbackContext;
 import com.openjiuwen.core.singleagent.rail.ModelCallInputs;
 import com.openjiuwen.core.singleagent.rail.ToolCallInputs;
@@ -231,6 +232,24 @@ public class EdpaEventRail extends DeepAgentRail {
     @Override
     public void beforeModelCall(AgentCallbackContext ctx) {
         // 不发任何事件（设计文档 §7.1）
+        // ★ 缓存用户原始 query 文本（供 afterModelCall 的 think_chunk query_patterns 匹配使用）
+        if (ctx.getInputs() instanceof ModelCallInputs inputs) {
+            List<?> messages = inputs.getMessages();
+            if (messages != null && !messages.isEmpty()) {
+                // 从后往前找最后一条 UserMessage（跳过 ToolMessage/AssistantMessage）
+                for (int i = messages.size() - 1; i >= 0; i--) {
+                    Object msg = messages.get(i);
+                    if (msg == null) continue;
+                    if (msg instanceof UserMessage um) {
+                        String text = um.getContentAsString();
+                        if (text != null && !text.isBlank()) {
+                            ctx.getExtra().put("_edp_user_input", text);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /**
@@ -349,19 +368,28 @@ public class EdpaEventRail extends DeepAgentRail {
         // 中断接管型（_skip_tool=true 但非 PLAN_FIRST）或真实执行：工具已执行/将执行 → 发 tool_start
         String mode = Boolean.TRUE.equals(ctx.getExtra().get(ScriptConstants.KEY_SKIP_TOOL)) ? "interrupt-handled" : "real-exec";
         // 缓存 call_versatile 的 query_intent 参数（供后续 todo_modify 的 todo_start/end 使用，对齐 Python _last_query_intent）
+        String queryIntent = "";
         if (TOOL_CALL_VERSATILE.equals(toolName)) {
             Map<String, Object> args = normalizeToolArgs(inputs.getToolArgs());
-            String queryIntent = String.valueOf(args.getOrDefault("query_intent", ""));
+            queryIntent = String.valueOf(args.getOrDefault("query_intent", ""));
             if (!queryIntent.isBlank() && !"null".equals(queryIntent)) {
                 ctx.getExtra().put(KEY_LAST_QUERY_INTENT, queryIntent);
                 LOGGER.info("[EDPA-DIAG] beforeToolCall tool={} cached query_intent={}", toolName, queryIntent);
             }
         }
-        LOGGER.info("[EDPA-DIAG] beforeToolCall tool={} mode={} -> emit tool_start", toolName, mode);
+        // UC-A03: tool_start 话术来源对齐 Python execution_limit_rail.py L228-234
+        // 优先1: LLM 传入的 query_description；兜底: tool_start 模板（{tool_name}）
+        // query_intent_tool_text 仅影响 todo_start/todo_end（文档 E-04）
+        Map<String, Object> argsForStart = normalizeToolArgs(inputs.getToolArgs());
+        Object qd = argsForStart.get("query_description");
+        String toolStartContent = (qd != null && !String.valueOf(qd).isBlank() && !"null".equals(String.valueOf(qd)))
+                ? String.valueOf(qd)
+                : ScriptResolver.resolve(scripts, EdpaEventType.TOOL_START.wireName(), Map.of("tool_name", safe(toolName)));
+        LOGGER.info("[EDPA-DIAG] beforeToolCall tool={} mode={} queryIntent={} -> emit tool_start", toolName, mode, queryIntent);
         toolOpen.put(sid, true);
         emit(ctx, EdpaEventType.TOOL_START, Map.of(
                 "tool", toolName,
-                "content", ScriptResolver.toolStart(scripts, toolName)));
+                "content", toolStartContent));
     }
 
     /**
@@ -391,12 +419,56 @@ public class EdpaEventRail extends DeepAgentRail {
                 return;
             }
             Object toolResult = inputs.getToolResult();
+            // UC-A05: 解析 tool_result 中的 ui_notice（对齐 Python versatile_interrupt_rail.py L196-230）
+            // 工具返回值可包含 ui_notice: {"event": "tool_end"|"todo_end"|"interrupt_start", "key": "<scripts_key>"}
+            // 不依赖沙箱执行——任何工具（Mock、真实 API）都可在返回值中注入 ui_notice
+            String toolEndContent = ScriptResolver.resolve(scripts,
+                    EdpaEventType.TOOL_END.wireName(), Map.of("tool_name", safe(toolName)));
+            String uiNoticeEvent = null;
+            String uiNoticeText = null;
+            if (toolResult instanceof Map<?, ?> resultMap) {
+                Object uiNoticeObj = resultMap.get("ui_notice");
+                if (uiNoticeObj instanceof Map<?, ?> uiNotice) {
+                    Object eventObj = uiNotice.get("event");
+                    Object keyObj = uiNotice.get("key");
+                    if (eventObj != null && keyObj != null) {
+                    String noticeEvent = String.valueOf(eventObj).trim();
+                    String noticeKey = String.valueOf(keyObj).trim();
+                    if (!noticeEvent.isEmpty() && !noticeKey.isEmpty() && scripts != null) {
+                        String noticeText = scripts.getTemplate(noticeKey);
+                        if (noticeText != null && !noticeText.isBlank()) {
+                            if ("interrupt_start".equals(noticeEvent)) {
+                                // 中断话术：走 response_template 机制，由 afterInvoke 发射
+                                ctx.getExtra().put(ScriptConstants.KEY_RESPONSE_TEMPLATE, noticeText);
+                                LOGGER.info("[EDPA-DIAG] ui_notice interrupt_start: key={}, text={}", noticeKey, noticeText);
+                            } else {
+                                // 非中断话术（tool_end/todo_end）：直接覆盖对应事件 content
+                                uiNoticeEvent = noticeEvent;
+                                uiNoticeText = noticeText;
+                                if ("tool_end".equals(noticeEvent)) {
+                                    toolEndContent = noticeText;
+                                }
+                                LOGGER.info("[EDPA-DIAG] ui_notice {}: key={}, text={}", noticeEvent, noticeKey, noticeText);
+                            }
+                        }
+                    }
+                    }
+                }
+            }
             Map<String, Object> payload = new LinkedHashMap<>();
             payload.put("tool", toolName);
             payload.put("data", toolResult != null ? toolResult : "");
-            payload.put("content", ScriptResolver.toolEnd(scripts, toolName));
+            // UC-A03: tool_end 话术仅用兜底模板，query_intent_tool_text 仅影响 todo_start/todo_end
+            // UC-A05: ui_notice 可覆盖 tool_end 话术
+            payload.put("content", toolEndContent);
             LOGGER.info("[EDPA-DIAG] afterToolCall tool={} -> emit tool_end", toolName);
             emit(ctx, EdpaEventType.TOOL_END, payload);
+            // UC-A05: ui_notice 的 todo_end 事件直发
+            if (uiNoticeEvent != null && "todo_end".equals(uiNoticeEvent)) {
+                emit(ctx, EdpaEventType.TODO_END, Map.of(
+                        "content", uiNoticeText,
+                        "status", "done"));
+            }
             toolOpen.put(sid, false);
             return;
         }
@@ -494,6 +566,7 @@ public class EdpaEventRail extends DeepAgentRail {
             String interruptId = java.util.UUID.randomUUID().toString();
             interruptIdMap.put(sid, interruptId);
             String toolName = "";
+            String content;
             if (ctx.getInputs() instanceof ToolCallInputs inputs) {
                 toolName = inputs.getToolName();
                 // F3-fix：ask_user 话术在 onToolException 解析（异常处理回调必触发；
@@ -502,11 +575,22 @@ public class EdpaEventRail extends DeepAgentRail {
                     ScriptResolver.resolveAskUser(scripts, inputs.getToolArgs(), ctx.getExtra());
                 }
             }
-            // content：优先读刚解析的业务话术（_edp_response_template），缺则回落 interrupt_start 配置兜底。
+            // UC-C02: interrupt_source 开关控制追问内容来源
+            // 对齐 Python ask_user_rail.py L172-180: 未命中脚本时放行 LLM question
+            String interruptSource = scripts != null ? scripts.getInterruptSource() : "script";
             Object rt = ctx.getExtra().get(ScriptConstants.KEY_RESPONSE_TEMPLATE);
-            String content = (rt != null && !String.valueOf(rt).isBlank())
-                    ? String.valueOf(rt) : ScriptResolver.interruptStart(scripts);
-            LOGGER.info("[EDPA-DIAG] onToolException ToolInterruptException -> emit interrupt_start(tool={}, interrupt_id={})", toolName, interruptId);
+            if (rt != null && !String.valueOf(rt).isBlank()) {
+                // 脚本话术命中（response_template 已解析）
+                content = String.valueOf(rt);
+            } else {
+                // 未命中脚本：用 LLM question 兜底（不丢弃），缺则用 interrupt_start 配置
+                String llmQuestion = extractAskUserQuestion(ctx);
+                content = llmQuestion.isBlank()
+                        ? ScriptResolver.interruptStart(scripts)
+                        : llmQuestion;
+            }
+            LOGGER.info("[EDPA-DIAG] onToolException ToolInterruptException -> emit interrupt_start(tool={}, interrupt_id={}, source={})",
+                    toolName, interruptId, interruptSource);
             emit(ctx, EdpaEventType.INTERRUPT_START, Map.of(
                     "tool", toolName,
                     "content", content,
@@ -1130,12 +1214,63 @@ public class EdpaEventRail extends DeepAgentRail {
     }
 
     /**
+     * 从 ask_user 工具入参中提取 LLM 生成的 question 文本（UC-C02: interrupt_source=llm 时使用）。
+     */
+    @SuppressWarnings("unchecked")
+    private String extractAskUserQuestion(AgentCallbackContext ctx) {
+        if (ctx.getInputs() instanceof ToolCallInputs inputs) {
+            Object args = inputs.getToolArgs();
+            if (args instanceof Map<?, ?> map) {
+                Object q = map.get("question");
+                if (q != null && !String.valueOf(q).isBlank()) {
+                    return String.valueOf(q);
+                }
+            } else if (args instanceof String s && !s.isBlank()) {
+                try {
+                    Map<String, Object> parsed = new com.fasterxml.jackson.databind.ObjectMapper()
+                            .readValue(s, new com.fasterxml.jackson.core.type.TypeReference<java.util.LinkedHashMap<String, Object>>() {});
+                    Object q = parsed.get("question");
+                    if (q != null && !String.valueOf(q).isBlank()) {
+                        return String.valueOf(q);
+                    }
+                } catch (Exception ignore) {
+                    // 非 JSON
+                }
+            }
+        }
+        return "";
+    }
+
+    /**
      * 获取用户原始 query 文本。
      */
     private String getUserQuery(AgentCallbackContext ctx) {
+        // 优先从 extra 缓存读取
         Object userInput = ctx.getExtra().getOrDefault("_edp_user_input", "");
-        if (userInput instanceof String s) {
+        if (userInput instanceof String s && !s.isBlank()) {
             return s;
+        }
+        // 兜底：从 ModelContext 获取最后一条 UserMessage
+        try {
+            var modelContext = ctx.getContext();
+            if (modelContext != null) {
+                var messages = modelContext.getMessages();
+                if (messages != null && !messages.isEmpty()) {
+                    for (int i = messages.size() - 1; i >= 0; i--) {
+                        var msg = messages.get(i);
+                        if (msg == null) continue;
+                        if (msg instanceof UserMessage um) {
+                            String text = um.getContentAsString();
+                            if (text != null && !text.isBlank()) {
+                                ctx.getExtra().put("_edp_user_input", text);
+                                return text;
+                            }
+                        }
+                    }
+                }
+            }
+        } catch (Exception e) {
+            LOGGER.debug("[EDPA-DIAG] getUserQuery fallback failed: {}", e.getMessage());
         }
         return "";
     }
@@ -1153,9 +1288,14 @@ public class EdpaEventRail extends DeepAgentRail {
             List<String> scriptsList = ScriptResolver.selectFixedScripts(scripts, phase, userQuery);
             if (!scriptsList.isEmpty()) {
                 int charsPerFrame = ScriptResolver.parseIntOrDefault(scripts.getTemplate(FK_PREFIX + "chars_per_frame"), 4);
+                int minIntervalMs = ScriptResolver.parseIntOrDefault(scripts.getTemplate(FK_PREFIX + "min_interval_ms"), 0);
                 List<String> frames = ScriptResolver.splitFixedScriptsIntoFrames(scriptsList, charsPerFrame);
                 for (String frame : frames) {
                     emit(ctx, EdpaEventType.THINK_CHUNK, Map.of("content", frame));
+                    // UC-B03: 按 min_interval_ms 间隔逐帧推送（对齐 Python FixedScriptFeeder._min_interval_ms）
+                    if (minIntervalMs > 0) {
+                        try { Thread.sleep(minIntervalMs); } catch (InterruptedException ignored) { Thread.currentThread().interrupt(); }
+                    }
                 }
             }
             LOGGER.info("[EDPA-DIAG] sid={} phase={} -> fixed_frame think (frames={})",
