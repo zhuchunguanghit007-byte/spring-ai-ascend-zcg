@@ -79,7 +79,7 @@ public class McpInterruptRail extends AgentRail {
 
         LOGGER.info("McpInterruptRail: intercepting call_mcp for local script execution");
         ctx.getExtra().put(ScriptConstants.KEY_SKIP_TOOL, Boolean.TRUE);
-        Map<String, Object> result = executeMcpScript(inputs);
+        Map<String, Object> result = executeMcpScript(inputs, ctx);
         inputs.setToolResult(result);
         inputs.setToolMsg(ToolMessage.builder()
                 .content(toJson(result))
@@ -138,7 +138,7 @@ public class McpInterruptRail extends AgentRail {
         }
     }
 
-    private Map<String, Object> executeMcpScript(ToolCallInputs inputs) {
+    private Map<String, Object> executeMcpScript(ToolCallInputs inputs, AgentCallbackContext ctx) {
         Map<String, Object> args = normalizeArgs(inputs);
         String scriptCommand = asString(args.get("script_command"));
         if (isBlank(scriptCommand)) {
@@ -146,7 +146,8 @@ public class McpInterruptRail extends AgentRail {
         }
 
         Map<String, Object> scriptParams = normalizeArgsObject(args.get("script_params"));
-        String argumentsJson = toJson(scriptParams);
+        Map<String, Object> skillInput = buildSkillInput(scriptParams, ctx);
+        String argumentsJson = toJson(skillInput);
         List<String> command = buildCommand(scriptCommand);
         Path workDir = resolveWorkDir(command);
 
@@ -204,6 +205,43 @@ public class McpInterruptRail extends AgentRail {
             LOGGER.warn("McpInterruptRail: local script execution failed: {}", e.getMessage());
             return failedResult(e.getMessage());
         }
+    }
+
+    /**
+     * 构造传给沙箱脚本的 SKILL_INPUT。
+     *
+     * <p>对齐 Python MCPInterruptRail._build_skill_input：合并 script_params 与
+     * 从 ToolDataChannel 读取的持久化字段（history_info / history_params），
+     * 持久化字段覆盖 LLM 可能传入的同名字段，避免 LLM 搬运导致的截断或遗漏风险。
+     * mcp_required_params 在 Java 端由 LLM 通过 script_params 传入（设计与 Python 不同，
+     * Python 从 session.state["original_body"] 读取以避免经过 LLM）。</p>
+     */
+    private Map<String, Object> buildSkillInput(Map<String, Object> scriptParams, AgentCallbackContext ctx) {
+        Map<String, Object> skillInput = new LinkedHashMap<>(scriptParams);
+
+        ToolDataKey key = ToolDataKeyFactory.fromContext(ctx, edpConfig);
+        Object historyInfo = toolDataChannel.getObject(key, HISTORY_INFO_KEY);
+        if (historyInfo instanceof Map<?, ?> map && map.containsKey("value")) {
+            skillInput.put(HISTORY_INFO_KEY, map.get("value"));
+        } else if (historyInfo != null) {
+            skillInput.put(HISTORY_INFO_KEY, historyInfo);
+        } else {
+            skillInput.putIfAbsent(HISTORY_INFO_KEY, List.of());
+        }
+
+        Object historyParams = toolDataChannel.getObject(key, HISTORY_PARAMS_KEY);
+        if (historyParams instanceof Map<?, ?> map) {
+            skillInput.put(HISTORY_PARAMS_KEY, toStringKeyMap(map));
+        } else if (historyParams != null) {
+            skillInput.put(HISTORY_PARAMS_KEY, historyParams);
+        } else {
+            skillInput.putIfAbsent(HISTORY_PARAMS_KEY, Map.of());
+        }
+
+        LOGGER.info("McpInterruptRail: injected from ToolDataChannel key={}, history_info={}, history_params={}",
+                key, abbreviate(String.valueOf(skillInput.get(HISTORY_INFO_KEY))),
+                abbreviate(String.valueOf(skillInput.get(HISTORY_PARAMS_KEY))));
+        return skillInput;
     }
 
     private Thread readAsync(java.io.InputStream inputStream, StringBuilder target) {
@@ -414,14 +452,19 @@ public class McpInterruptRail extends AgentRail {
     }
 
     private Map<String, Object> failedResult(String message) {
-        return Map.of(
-                "status", "failed",
-                "tool", "call_mcp",
-                "mcp_error", message != null ? message : "unknown error",
-                "products", List.of(),
-                "total", 0,
-                "versatile_query", "推荐理财产品，关键词：固收，风险等级：R2",
-                "result_key", DEFAULT_MCP_PRODUCTS_KEY);
+        // 对齐 Python MCPInterruptRail._build_error_result：失败时清空 history_info 和 history_params，
+        // 使下次调用不继承上次条件；不含 versatile_query（Python 端失败时不注入此字段）。
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("status", "failed");
+        result.put("tool", "call_mcp");
+        result.put("mcp_error", message != null ? message : "unknown error");
+        result.put("products", List.of());
+        result.put("total", 0);
+        result.put("next_sort_type", 0);
+        result.put("history_params", Map.of());
+        result.put("history_info", List.of());
+        result.put("result_key", DEFAULT_MCP_PRODUCTS_KEY);
+        return result;
     }
 
     private String toJson(Object value) {

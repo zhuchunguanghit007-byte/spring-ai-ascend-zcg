@@ -107,6 +107,8 @@ public class ScriptsRail extends DeepAgentRail {
         String resolvedKey = scripts.resolveScriptKey("SCRIPT_" + reason.toUpperCase().replace("-", "_"));
         String text = scripts.getScriptOrDefault("SCRIPT_" + reason.toUpperCase().replace("-", "_"), "");
         if (isBlank(text)) {
+            // 对齐 Python cancel_rail.py 第 43 行：话术 key 未找到时记录 warn 日志，不阻断取消流程。
+            LOGGER.warn("[EDPA-SCRIPT] cancel_task response_template not found for reason={}, skip script injection", reason);
             return;
         }
         ctx.getExtra().put(ScriptConstants.KEY_RESPONSE_TEMPLATE, text);
@@ -240,8 +242,9 @@ public class ScriptsRail extends DeepAgentRail {
 
     @Override
     public void afterInvoke(AgentCallbackContext ctx) {
-        // 出口话术已由 EdpaEventRail.afterInvoke（priority=80）通过 conversation_end content 输出。
-        // 本 Rail（priority=50）不再重复发射，仅执行合规把关（若 _edp_response_template 仍存在）。
+        // 出口 interrupt_start 已由 EdpaEventRail.afterInvoke（priority=80）在 conversation_end 之前发射。
+        // 本 Rail（priority=50）不再重复发射，仅执行合规把关兜底（若 _edp_response_template 仍存在）。
+        // 实际上 EdpaEventRail 已内置合规把关并清除 KEY_RESPONSE_TEMPLATE，此处通常直接 return。
         String text = readResponseTemplate(ctx);
         if (isBlank(text)) {
             return;

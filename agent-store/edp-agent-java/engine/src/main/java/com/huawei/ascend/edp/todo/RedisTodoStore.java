@@ -33,7 +33,7 @@ public class RedisTodoStore {
     private static final TypeReference<List<TodoItem>> TODO_TYPE = new TypeReference<>() {};
 
     /** Redis 最低版本要求（UC-01/UC-02 AF-02-B）。 */
-    private static final String MIN_REDIS_VERSION = "6.2";
+    private static final String MIN_REDIS_VERSION = "5.0";
 
     private final StringRedisTemplate redis;
     private final TodoRedisProperties props;

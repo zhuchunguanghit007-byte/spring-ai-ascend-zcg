@@ -361,10 +361,11 @@ public final class ScriptResolver {
             return "";
         }
         StringBuilder sb = new StringBuilder("## 取消/超范围话术规则\n");
+        // UC-C03 两步取消：cancel_confirm 由 ask_user(status=cancel_confirm) 触发（见 businessRulesPrompt），
+        // cancel_task 的 reason 只列真正用于"执行取消"的 key，避免 LLM 混淆两步流程。
         sb.append("调用 cancel_task 时 reason 须取以下值之一（对应配置内话术）：");
-        appendScriptKey(sb, scripts, "task_cancelled", "取消任务");
-        appendScriptKey(sb, scripts, "cancel_confirm", "取消确认");
-        appendScriptKey(sb, scripts, "out_of_scope", "超范围");
+        appendKey(sb, scripts, ScriptConstants.SCRIPT_TASK_CANCELLED, "取消任务");
+        appendKey(sb, scripts, ScriptConstants.SCRIPT_OUT_OF_SCOPE, "超范围");
         return sb.toString();
     }
 
@@ -382,11 +383,16 @@ public final class ScriptResolver {
         }
         StringBuilder sb = new StringBuilder("## 业务话术规则\n");
         sb.append("ask_user 通过 response_template_status + response_template_keys + response_template_vars 选话术：");
-        appendScriptKey(sb, scripts, "product_select_confirm", "选品确认（vars: productName, amount）");
-        appendScriptKey(sb, scripts, "product_select_missing_amount", "缺金额");
-        appendScriptKey(sb, scripts, "product_select_missing_product", "缺产品");
-        appendScriptKey(sb, scripts, "fund_planning_success", "购买成功（vars: orderId）");
-        appendScriptKey(sb, scripts, "mcp_result_empty", "MCP 空结果");
+        appendKey(sb, scripts, ScriptConstants.SCRIPT_PRODUCT_SELECT_CONFIRM, "选品确认（vars: productName, amount）");
+        appendKey(sb, scripts, ScriptConstants.SCRIPT_PRODUCT_SELECT_MISSING_AMOUNT, "缺金额");
+        appendKey(sb, scripts, ScriptConstants.SCRIPT_PRODUCT_SELECT_MISSING_PRODUCT, "缺产品");
+        appendKey(sb, scripts, ScriptConstants.SCRIPT_FUND_PLANNING_SUCCESS, "购买成功（vars: orderId）");
+        appendKey(sb, scripts, ScriptConstants.SCRIPT_MCP_RESULT_EMPTY, "MCP 空结果");
+        // UC-C03 两步取消流程：第一步用 ask_user(status=cancel_confirm) 输出取消确认话术，
+        // 第二步用 cancel_task(reason=task_cancelled) 输出取消完成话术。
+        // cancel_confirm 在此列出以引导 LLM 用 ask_user 做取消确认时传对应话术参数，
+        // 避免漏传 status/keys 导致 Rail 走兜底拼接（与配置文案不一致）。
+        appendKey(sb, scripts, ScriptConstants.SCRIPT_CANCEL_CONFIRM, "取消确认（两步取消第一步）");
         return sb.toString();
     }
 
@@ -401,17 +407,17 @@ public final class ScriptResolver {
      * @param constantName 常量名（如 "task_cancelled"，不含 SCRIPT_ 前缀）
      * @param desc 描述文本
      */
-    private static void appendScriptKey(StringBuilder sb, SysScriptsConfig cfg, 
+    private static void appendKey(StringBuilder sb, SysScriptsConfig cfg,
             String constantName, String desc) {
         if (cfg == null || constantName == null) {
             return;
         }
-        // 检查话术是否存在（SCRIPT_ 前缀在 hasScript 内部处理）
-        if (!cfg.hasScript("SCRIPT_" + constantName.toUpperCase().replace("-", "_"))) {
+        // 检查话术是否存在（constantName 已含 SCRIPT_ 前缀）
+        if (!cfg.hasScript(constantName)) {
             return;
         }
         // 获取配置中的实际键名
-        String resolvedKey = cfg.resolveScriptKey("SCRIPT_" + constantName.toUpperCase().replace("-", "_"));
+        String resolvedKey = cfg.resolveScriptKey(constantName);
         sb.append("\n- ").append(resolvedKey).append("（").append(desc).append("）");
     }
 

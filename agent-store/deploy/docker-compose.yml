@@ -1,9 +1,10 @@
-# agent-store Docker Compose 部署配置
+# agent-store Docker Compose 部署配置（两容器版）
 #
-# Versatile Mock 由外部独立部署（不由本 Compose 管理）。
+# 本编排仅启动 adapter-versatile + edp-agent。
+# Versatile Mock、Redis、MCP Server 均由同事独立部署，在 .env 中填写可达地址。
 #
 # 用法（在 agent-store/deploy 目录）：
-#   cp .env.example .env    # 填写 LLM 密钥与同事提供的 Versatile 地址
+#   cp .env.example .env    # 填写 LLM 密钥、外部 Mock/Redis/MCP 地址
 #   docker compose up -d
 #
 # 详细步骤见 DEPLOYMENT.md
@@ -27,7 +28,8 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
     healthcheck:
-      test: ["CMD", "curl", "-sf", "http://localhost:8191/.well-known/agent-card.json"]
+      # adapter 镜像不带 curl，用 bash /dev/tcp 做端口探测
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8191"]
       interval: 10s
       timeout: 5s
       retries: 8
@@ -50,24 +52,30 @@ services:
       SERVER_PORT: "8190"
       EDPA_AGENT_CONFIG_PATH: /app/config/edp-config.yaml
       EDP_AGENT_SCENARIO_HOME: /app/scenarios/wealth-demo
+      EDPA_REDIS_HOST: "${EDPA_REDIS_HOST:?EDPA_REDIS_HOST is required — set to colleague Redis host/IP}"
+      EDPA_REDIS_PORT: "${EDPA_REDIS_PORT:-6379}"
+      EDPA_REDIS_PASSWORD: "${EDPA_REDIS_PASSWORD:-}"
+      EDPA_REDIS_DB: "${EDPA_REDIS_DB:-0}"
       EDP_AGENT_MODEL_API_KEY: "${EDP_AGENT_MODEL_API_KEY:?EDP_AGENT_MODEL_API_KEY is required}"
       EDP_AGENT_MODEL_PROVIDER: "${EDP_AGENT_MODEL_PROVIDER:-OpenAI}"
       EDP_AGENT_MODEL_NAME: "${EDP_AGENT_MODEL_NAME:-deepseek-v4-pro}"
       EDP_AGENT_MODEL_BASE_URL: "${EDP_AGENT_MODEL_BASE_URL:-https://api.deepseek.com/v1}"
       EDP_AGENT_VERSATILE_A2A_URL: "${EDP_AGENT_VERSATILE_A2A_URL:-http://adapter-versatile:8191/a2a}"
-      EDP_AGENT_VERSATILE_URL: "${EDP_AGENT_VERSATILE_URL:-}"
-      MCP_MASTER_URL: "${MCP_MASTER_URL:-}"
-      MCP_STANDBY_URL: "${MCP_STANDBY_URL:-}"
-      MCP_ACCESS_TOKEN: "${MCP_ACCESS_TOKEN:-}"
-      MCP_APP_NAME: "${MCP_APP_NAME:-f-mlp}"
+      # 启动校验器要求合法 http URL，切勿留空；默认同机 Mock 用 host.docker.internal
+      EDP_AGENT_VERSATILE_URL: "${EDP_AGENT_VERSATILE_URL:-http://host.docker.internal:30001/v1/0/agent-manager/workflows/{workflow_id}/conversations/{conversation_id}}"
+      # MCP：application.yml 读取 EDP_MCP_*；兼容旧 .env 中的 MCP_* 写法
+      EDP_MCP_MASTER_URL: "${EDP_MCP_MASTER_URL:-${MCP_MASTER_URL:-}}"
+      EDP_MCP_STANDBY_URL: "${EDP_MCP_STANDBY_URL:-${MCP_STANDBY_URL:-}}"
+      EDP_MCP_ACCESS_TOKEN: "${EDP_MCP_ACCESS_TOKEN:-${MCP_ACCESS_TOKEN:-}}"
+      EDP_MCP_APP_NAME: "${EDP_MCP_APP_NAME:-${MCP_APP_NAME:-f-mlp}}"
     extra_hosts:
       - "host.docker.internal:host-gateway"
     healthcheck:
-      test: ["CMD", "curl", "-sf", "http://localhost:8190/.well-known/agent-card.json"]
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8190/.well-known/agent-card.json', timeout=3)"]
       interval: 10s
       timeout: 5s
-      retries: 5
-      start_period: 60s
+      retries: 8
+      start_period: 90s
     networks:
       - agent-store-net
 

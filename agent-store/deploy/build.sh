@@ -28,4 +28,5 @@ docker build -t edp-agent-java:latest \
 
 echo "Done. 下一步："
 echo "  cd agent-store/deploy && cp .env.example .env && vi .env"
+echo "  # 必填：EDP_AGENT_MODEL_API_KEY、EDPA_REDIS_HOST、VERSATILE_URL"
 echo "  docker compose up -d"

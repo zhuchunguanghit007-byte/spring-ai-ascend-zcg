@@ -10,6 +10,8 @@ import com.huawei.ascend.edp.channel.ToolDataKeyFactory;
 import com.huawei.ascend.edp.config.EdpaSpringBootConfig;
 import com.huawei.ascend.edp.config.EdpConfig;
 import com.huawei.ascend.edp.config.ScriptConstants;
+import com.huawei.ascend.edp.config.SysScriptsConfig;
+import com.openjiuwen.core.foundation.llm.schema.ToolCall;
 import com.openjiuwen.core.foundation.llm.schema.ToolMessage;
 import com.openjiuwen.core.session.interaction.InteractiveInput;
 import com.openjiuwen.core.singleagent.interrupt.InterruptRequest;
@@ -26,6 +28,8 @@ import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
@@ -62,6 +66,20 @@ public class VersatileInterruptRail extends AgentRail {
     private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
 
     /**
+     * pre-delegate guard 计数器在 ToolDataChannel 中的 key 前缀。
+     * 对齐 Python versatile_interrupt_rail.py 第 434 行 {@code state_key = f"_pre_delegate_guard:{command}:{rule_id}"}，
+     * 用 {@code command:ruleId} 作为唯一标识，避免不同 skill 的同名规则互相干扰。
+     */
+    static final String GUARD_STATE_KEY_PREFIX = "_pre_delegate_guard:";
+
+    /**
+     * history_info 字段名。与 {@link McpInterruptRail#HISTORY_INFO_KEY} 同名，
+     * 保证 call_versatile 写入的 history_info 能被下一次 call_mcp 的 buildSkillInput 读到，
+     * 形成跨工具的会话级持久化闭环（对齐 Python {@code session.state["history_info"]}）。
+     */
+    static final String HISTORY_INFO_KEY = "history_info";
+
+    /**
      * EDP 专有配置，当前预留给 VA 委托策略和目标 Agent 配置使用。
      */
     private final EdpConfig edpConfig;
@@ -71,6 +89,18 @@ public class VersatileInterruptRail extends AgentRail {
     /** 与 EdpaRuntimeHandler 共享，存放 adapter 返回的完整 Versatile message JSON。 */
     private final VersatilePassthroughBuffer passthroughBuffer;
     private final HttpClient httpClient;
+
+    /**
+     * skills 目录，用于 pre-delegate guard 静态解析脚本中的 {@code PRE_DELEGATE_GUARD} 配置。
+     * 为 null 时 guard 直接跳过（不影响主流程）。
+     */
+    private final Path skillsDir;
+
+    /**
+     * 话术配置，用于 pre-delegate guard 超限时解析 {@code response_template_key} 兜底话术。
+     * 为 null 时回落到规则的 {@code fallback_message}。
+     */
+    private final SysScriptsConfig scripts;
 
     /**
      * 构造 VA 委托 Rail。
@@ -92,10 +122,28 @@ public class VersatileInterruptRail extends AgentRail {
 
     public VersatileInterruptRail(EdpConfig edpConfig, EdpaSpringBootConfig.VersatileConfig versatileConfig,
             ToolDataChannel toolDataChannel, VersatilePassthroughBuffer passthroughBuffer) {
+        this(edpConfig, versatileConfig, toolDataChannel, passthroughBuffer, null, null);
+    }
+
+    /**
+     * 全参构造：供 {@link com.huawei.ascend.edp.enhancer.EdpaAgentEnhancer} 注入 skillsDir 与话术配置。
+     *
+     * <p>注：{@link com.huawei.ascend.edp.handler.EdpaRuntimeHandler} 续传路径仍用四参构造
+     * （skillsDir/scripts 为 null），guard 与持久化都不会在该路径触发——续传是已中断后的恢复，
+     * 不应重新跑 guard 计数，也不应重复持久化 history_info。</p>
+     *
+     * @param skillsDir skills 目录，用于 pre-delegate guard 静态解析
+     * @param scripts 话术配置，用于 guard 超限兜底话术
+     */
+    public VersatileInterruptRail(EdpConfig edpConfig, EdpaSpringBootConfig.VersatileConfig versatileConfig,
+            ToolDataChannel toolDataChannel, VersatilePassthroughBuffer passthroughBuffer,
+            Path skillsDir, SysScriptsConfig scripts) {
         this.edpConfig = edpConfig;
         this.versatileConfig = versatileConfig;
         this.toolDataChannel = toolDataChannel != null ? toolDataChannel : new ToolDataChannel();
         this.passthroughBuffer = passthroughBuffer != null ? passthroughBuffer : new VersatilePassthroughBuffer();
+        this.skillsDir = skillsDir != null ? skillsDir.toAbsolutePath().normalize() : null;
+        this.scripts = scripts;
         Duration timeout = versatileConfig != null ? parseTimeout(versatileConfig.getTimeout()) : Duration.ofSeconds(30);
         this.httpClient = HttpClient.newBuilder()
                 .connectTimeout(timeout)
@@ -107,6 +155,13 @@ public class VersatileInterruptRail extends AgentRail {
 
     /**
      * 工具调用前回调。
+     *
+     * <p>执行顺序（对齐 Python {@code resolve_interrupt}）：</p>
+     * <ol>
+     *     <li>续传路径：用户已提交菜单确认等输入，直接回填工具结果。</li>
+     *     <li>pre-delegate guard：从脚本静态读取 {@code PRE_DELEGATE_GUARD}，超限则终止。</li>
+     *     <li>委托 adapter 执行业务流程。</li>
+     * </ol>
      *
      * @param ctx OpenJiuwen 回调上下文，包含工具调用信息
      */
@@ -137,6 +192,15 @@ public class VersatileInterruptRail extends AgentRail {
             }
             LOGGER.info("VersatileInterruptRail: intercepting call_versatile, direct call to versatile service");
 
+            // pre-delegate guard：在真正委托 adapter 之前检查 skill 声明的前置规则。
+            // 超限时直接终止当前 ReAct 流程，避免 adapter 继续执行真实业务（如转账）。
+            // 对齐 Python versatile_interrupt_rail.py 第 128-130 行。
+            GuardDecision guardDecision = applyPreDelegateGuard(ctx, normalizeArgs(inputs));
+            if (guardDecision != null && guardDecision.blocked()) {
+                blockCallVersatileByGuard(ctx, inputs, toolCallId, guardDecision);
+                return;
+            }
+
             ctx.getExtra().put(ScriptConstants.KEY_SKIP_TOOL, Boolean.TRUE);
 
             Map<String, Object> toolResult = callVersatile(inputs, ctx);
@@ -150,6 +214,38 @@ public class VersatileInterruptRail extends AgentRail {
                     .toolCallId(inputs.getToolCall() != null ? inputs.getToolCall().getId() : "call_versatile")
                     .build());
         }
+    }
+
+    /**
+     * pre-delegate guard 超限时的统一收尾：写话术、强制结束、回填失败 toolResult。
+     *
+     * <p>必须同时设置 toolResult 与 toolMsg，否则 OpenJiuwen 会因 tool_call 无对应 tool_response
+     * 而在 forceFinish 后的 LLM 调用中 HTTP 400（沿用 {@link CancelRail} 的成熟模式）。
+     * 对齐 Python {@code _apply_pre_delegate_guard} 第 452-468 行：</p>
+     * <ul>
+     *     <li>response_template 写入 extra（北向话术通道，由 EdpaEventRail 出口发射）。</li>
+     *     <li>{@code requestForceFinish} 终止 ReAct 循环。</li>
+     *     <li>{@code reject} 跳过本次工具调用 → 此处用 KEY_SKIP_TOOL=true 等价。</li>
+     * </ul>
+     */
+    private void blockCallVersatileByGuard(AgentCallbackContext ctx, ToolCallInputs inputs,
+            String toolCallId, GuardDecision decision) {
+        ctx.getExtra().put(ScriptConstants.KEY_RESPONSE_TEMPLATE, decision.message());
+        ctx.requestForceFinish(Map.of(
+                "result_type", "interrupt",
+                "state", List.of(),
+                "interrupt_ids", List.of()));
+        Map<String, Object> blockedResult = new LinkedHashMap<>();
+        blockedResult.put("status", "failed");
+        blockedResult.put("message", decision.message());
+        inputs.setToolResult(blockedResult);
+        inputs.setToolMsg(ToolMessage.builder()
+                .content(toJson(blockedResult))
+                .toolCallId(toolCallId)
+                .build());
+        ctx.getExtra().put(ScriptConstants.KEY_SKIP_TOOL, Boolean.TRUE);
+        LOGGER.warn("VersatileInterruptRail: pre-delegate guard blocked, rule={}, count={}, limit={}, message={}",
+                decision.ruleId(), decision.count(), decision.maxCalls(), decision.message());
     }
 
     private Map<String, Object> callVersatile(ToolCallInputs inputs, AgentCallbackContext ctx) {
@@ -647,6 +743,35 @@ public class VersatileInterruptRail extends AgentRail {
         return value.substring(0, 2000) + "...(truncated)";
     }
 
+    /** 安全转 String：null 返回空串。 */
+    private String asString(Object value) {
+        return value == null ? "" : String.valueOf(value);
+    }
+
+    /** 安全转 int：null 或非数字返回默认值。 */
+    private int asInt(Object value, int defaultValue) {
+        if (value instanceof Number n) {
+            return n.intValue();
+        }
+        if (value instanceof String s && !s.isBlank()) {
+            try {
+                return Integer.parseInt(s.trim());
+            } catch (NumberFormatException ignored) {
+                // 落入默认值
+            }
+        }
+        return defaultValue;
+    }
+
+    /** 把任意 Map 归一为 String 键的 Map。 */
+    private Map<String, Object> toStringKeyMap(Object source) {
+        Map<String, Object> result = new LinkedHashMap<>();
+        if (source instanceof Map<?, ?> map) {
+            map.forEach((k, v) -> result.put(String.valueOf(k), v));
+        }
+        return result;
+    }
+
     private Map<String, Object> failedResult(String error) {
         return Map.of("source", "versatile", "status", "failed", "error", error != null ? error : "unknown");
     }
@@ -662,6 +787,14 @@ public class VersatileInterruptRail extends AgentRail {
     /**
      * 工具调用后回调。
      *
+     * <p>职责一：history_info 持久化（对齐 Python versatile_interrupt_rail.py 第 295-321 行）。</p>
+     * <p>当前 adapter 归一化结果（{@code normalizeA2aAdapterResponse} 产出）顶层不含 history_info，
+     * 此处为未来归一化脚本落地后的预留接入点：脚本输出含 history_info 时自动持久化到 ToolDataChannel，
+     * 供下一次 call_mcp 的 buildSkillInput 读取，形成跨工具的会话级持久化闭环。
+     * 持久化后从 toolResult/toolMsg 出口剔除该字段，避免 LLM 看到内部字段（对齐 Python 第 321 行）。</p>
+     *
+     * <p>职责二：记录 call_versatile 完成事件。</p>
+     *
      * @param ctx OpenJiuwen 回调上下文，包含工具调用和工具结果信息
      */
     @Override
@@ -672,10 +805,283 @@ public class VersatileInterruptRail extends AgentRail {
         }
         String toolName = inputs.getToolName();
 
-        // 关键判断：只记录 call_versatile 完成事件。
-        if ("call_versatile".equals(toolName)) {
-            LOGGER.info("VersatileInterruptRail: call_versatile completed, cascade result received");
+        // 关键判断：只处理 call_versatile。
+        if (!"call_versatile".equals(toolName)) {
+            return;
         }
+
+        // ── history_info 持久化 + 出口剔除 ──
+        persistHistoryInfoIfPresent(ctx, inputs);
+
+        LOGGER.info("VersatileInterruptRail: call_versatile completed, cascade result received");
+    }
+
+    /**
+     * 检查 toolResult 顶层是否含 history_info，有则持久化到 ToolDataChannel 并从出口剔除。
+     *
+     * <p>对齐 Python 第 297-306 行持久化、第 321 行剔除。无 history_info 时仅打 persistence check 日志，
+     * 与 Python 行为一致。持久化 key 与 {@link McpInterruptRail#HISTORY_INFO_KEY} 同名，
+     * 共享同一四元组隔离，下一次 call_mcp 能读到。</p>
+     */
+    private void persistHistoryInfoIfPresent(AgentCallbackContext ctx, ToolCallInputs inputs) {
+        Object rawResult = inputs.getToolResult();
+        if (!(rawResult instanceof Map<?, ?> rawMap)) {
+            LOGGER.info("VersatileInterruptRail: persistence check history_info=not in result");
+            return;
+        }
+        Map<String, Object> result = toStringKeyMap(rawMap);
+        if (!result.containsKey(HISTORY_INFO_KEY)) {
+            LOGGER.info("VersatileInterruptRail: persistence check history_info=not in result");
+            return;
+        }
+        Object historyInfo = result.get(HISTORY_INFO_KEY);
+        ToolDataKey channelKey = ToolDataKeyFactory.fromContext(ctx, edpConfig);
+        // 包装为 {"value": ...} 结构，与 McpInterruptRail 读取时的解包逻辑对齐。
+        toolDataChannel.store(channelKey, HISTORY_INFO_KEY,
+                Map.of("value", historyInfo != null ? historyInfo : List.of()));
+        LOGGER.info("VersatileInterruptRail: persistence check history_info=persisted:{}",
+                abbreviate(String.valueOf(historyInfo)));
+        // 出口剔除：从 toolResult 与 toolMsg 中移除，避免 LLM 看到内部字段。
+        result.remove(HISTORY_INFO_KEY);
+        inputs.setToolResult(result);
+        ToolCall toolCall = inputs.getToolCall();
+        if (toolCall != null && toolCall.getId() != null) {
+            inputs.setToolMsg(ToolMessage.builder()
+                    .content(toJson(result))
+                    .toolCallId(toolCall.getId())
+                    .build());
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // pre-delegate guard
+    // 对齐 Python versatile_interrupt_rail.py 第 421-525 行：
+    // 在真正委托 adapter 之前，从 skill 脚本静态读取 PRE_DELEGATE_GUARD 配置，
+    // 按 query_intent 维度计数，超限则终止当前 ReAct 流程，避免真实业务（如转账）被执行。
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /**
+     * 应用 pre-delegate guard。
+     *
+     * @param ctx  回调上下文
+     * @param args call_versatile 工具参数（含 query_intent / query_response_analysis_scripts 等）
+     * @return 超限判定；null 表示无 guard 或未超限，主流程继续
+     */
+    private GuardDecision applyPreDelegateGuard(AgentCallbackContext ctx, Map<String, Object> args) {
+        String command = asString(args.get("query_response_analysis_scripts"));
+        Map<String, Object> guard = loadPreDelegateGuard(command);
+        if (guard == null || guard.isEmpty()) {
+            return null;
+        }
+        Object rulesObj = guard.get("rules");
+        if (!(rulesObj instanceof List<?> rules) || rules.isEmpty()) {
+            return null;
+        }
+        ToolDataKey channelKey = ToolDataKeyFactory.fromContext(ctx, edpConfig);
+        for (Object ruleObj : rules) {
+            if (!(ruleObj instanceof Map<?, ?> rule)) {
+                continue;
+            }
+            Map<String, Object> ruleMap = toStringKeyMap(rule);
+            // match 表示这条规则只对哪些 tool_args 生效，例如 {"query_intent": "快速转账"}。
+            // 全部键值匹配才命中（等价 Python any(...) 取反的循环逻辑）。
+            Map<String, Object> match = toStringKeyMap(ruleMap.get("match"));
+            if (!match.isEmpty() && !matchesArgs(args, match)) {
+                continue;
+            }
+
+            String ruleId = asString(ruleMap.getOrDefault("id", "default"));
+            // state_key 用 command:ruleId 唯一标识，避免不同 skill 的同名规则互相干扰。
+            String stateKey = GUARD_STATE_KEY_PREFIX + command + ":" + ruleId;
+            int count = incrementGuardCount(channelKey, stateKey);
+            int maxCalls = asInt(ruleMap.get("max_calls"), 0);
+            LOGGER.info("VersatileInterruptRail: pre-delegate guard matched rule={}, count={}, limit={}, match={}",
+                    ruleId, count, maxCalls, match);
+            if (maxCalls > 0 && count > maxCalls) {
+                String message = resolveGuardMessage(ruleMap);
+                return new GuardDecision(true, ruleId, count, maxCalls, message);
+            }
+        }
+        return null;
+    }
+
+    /**
+     * 静态读取脚本中的 {@code PRE_DELEGATE_GUARD = {...}} 配置。
+     *
+     * <p>对齐 Python {@code _load_pre_delegate_guard}（第 477-525 行）：不 import、不执行脚本，
+     * 只静态解析字面量。Java 无 Python {@code ast} 模块，这里用括号配对截取字典字面量 + Jackson 解析，
+     * 安全性与 {@code ast.literal_eval} 等价（不执行任意代码）。</p>
+     *
+     * <p>跳过条件（与 Python 一致）：命令中无 .py 脚本、skillsDir 为 null、脚本越界、脚本不存在、
+     * 脚本中无 PRE_DELEGATE_GUARD 赋值。</p>
+     *
+     * @param command query_response_analysis_scripts 命令字符串
+     * @return guard 配置 Map；空 Map 表示跳过
+     */
+    private Map<String, Object> loadPreDelegateGuard(String command) {
+        String script = extractScriptName(command);
+        if (script == null || script.isBlank()) {
+            LOGGER.info("VersatileInterruptRail: pre-delegate guard skipped, no script in command={}", command);
+            return Map.of();
+        }
+        if (skillsDir == null) {
+            LOGGER.info("VersatileInterruptRail: pre-delegate guard skipped, skillsDir is null");
+            return Map.of();
+        }
+        Path scriptPath = skillsDir.resolve(script).toAbsolutePath().normalize();
+        // 路径越界保护：解析后的路径必须在 skillsDir 之下。
+        if (!scriptPath.startsWith(skillsDir)) {
+            LOGGER.warn("VersatileInterruptRail: pre-delegate guard skipped, script outside skills dir, path={}",
+                    scriptPath);
+            return Map.of();
+        }
+        if (!Files.exists(scriptPath) || !Files.isRegularFile(scriptPath)) {
+            LOGGER.info("VersatileInterruptRail: pre-delegate guard skipped, script not found, path={}", scriptPath);
+            return Map.of();
+        }
+        try {
+            String source = Files.readString(scriptPath, StandardCharsets.UTF_8);
+            String literal = extractAssignLiteral(source, "PRE_DELEGATE_GUARD");
+            if (literal == null) {
+                LOGGER.info("VersatileInterruptRail: pre-delegate guard skipped, PRE_DELEGATE_GUARD not found, path={}",
+                        scriptPath);
+                return Map.of();
+            }
+            @SuppressWarnings("unchecked")
+            Map<String, Object> parsed = OBJECT_MAPPER.readValue(literal, Map.class);
+            int ruleCount = parsed.get("rules") instanceof List<?> l ? l.size() : 0;
+            LOGGER.info("VersatileInterruptRail: pre-delegate guard loaded, path={}, rules={}", scriptPath, ruleCount);
+            return parsed;
+        } catch (Exception e) {
+            LOGGER.warn("VersatileInterruptRail: pre-delegate guard parse failed, path={}, err={}",
+                    scriptPath, e.getMessage());
+            return Map.of();
+        }
+    }
+
+    /**
+     * 从命令字符串中提取脚本文件名（第一个以 .py 结尾的 token）。
+     * 对齐 Python 第 480 行 {@code next((part for part in command.split() if part.endswith(".py")), "")}。
+     */
+    private String extractScriptName(String command) {
+        if (command == null || command.isBlank()) {
+            return "";
+        }
+        for (String token : command.split("\\s+")) {
+            if (token.endsWith(".py")) {
+                return token;
+            }
+        }
+        return "";
+    }
+
+    /**
+     * 从 Python 源码中截取 {@code name = {...}} 赋值的字典字面量。
+     *
+     * <p>实现：定位 {@code name = } 后第一个 {@code {}，按括号配对截取到匹配的 {@code }}。
+     * 字符串字面量内的括号不计入配对（感知单/双引号与转义），避免误截。
+     * 替代 Python {@code ast.literal_eval}——Java 无 AST 模块，但 PRE_DELEGATE_GUARD 是
+     * 标准 JSON-compatible dict 字面量，括号配对足够且不执行任意代码。</p>
+     *
+     * @return 字典字面量字符串（含外层花括号）；未找到返回 null
+     */
+    private String extractAssignLiteral(String source, String name) {
+        int assignIdx = source.indexOf(name + " =");
+        if (assignIdx < 0) {
+            assignIdx = source.indexOf(name + "=");
+        }
+        if (assignIdx < 0) {
+            return null;
+        }
+        int braceStart = source.indexOf('{', assignIdx + name.length());
+        if (braceStart < 0) {
+            return null;
+        }
+        int depth = 0;
+        boolean inString = false;
+        char quoteChar = 0;
+        for (int i = braceStart; i < source.length(); i++) {
+            char ch = source.charAt(i);
+            if (inString) {
+                if (ch == '\\') {
+                    i++; // 跳过转义字符
+                    continue;
+                }
+                if (ch == quoteChar) {
+                    inString = false;
+                }
+                continue;
+            }
+            if (ch == '\'' || ch == '"') {
+                inString = true;
+                quoteChar = ch;
+            } else if (ch == '{') {
+                depth++;
+            } else if (ch == '}') {
+                depth--;
+                if (depth == 0) {
+                    return source.substring(braceStart, i + 1);
+                }
+            }
+        }
+        return null;
+    }
+
+    /**
+     * 判断 tool_args 是否全部命中 match 中的键值。
+     * 对齐 Python 第 430 行 {@code any(tool_args.get(key) != value for key, value in match.items())} 的反向逻辑
+     * （Python 用 any+!= 表示"任一不匹配则跳过"，此处用 all+equals 表示"全部匹配才命中"）。
+     */
+    private boolean matchesArgs(Map<String, Object> args, Map<String, Object> match) {
+        for (Map.Entry<String, Object> entry : match.entrySet()) {
+            Object actual = args.get(entry.getKey());
+            Object expected = entry.getValue();
+            if (actual == null ? expected != null : !actual.equals(expected)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * 从 ToolDataChannel 读取并递增 guard 计数器。
+     *
+     * <p>对齐 Python {@code ctx.session.get_state(state_key)} + {@code update_state}。
+     * Java 端 {@code ctx.getExtra()} 是 per-request、跨轮丢失，故用 ToolDataChannel（会话级四元组隔离）
+     * 作为计数器存储，与 history_info / versatile_query 共享同一 channel。</p>
+     */
+    private int incrementGuardCount(ToolDataKey channelKey, String stateKey) {
+        Object current = toolDataChannel.getObject(channelKey, stateKey);
+        int count = (current instanceof Number n ? n.intValue() : 0) + 1;
+        toolDataChannel.store(channelKey, stateKey, count);
+        return count;
+    }
+
+    /**
+     * 解析 guard 超限话术：优先取 {@code response_template_key} 对应的话术模板，
+     * 缺失或为空则回落到规则的 {@code fallback_message}。
+     *
+     * <p>对齐 Python 第 444-449 行：
+     * {@code text = scripts.get_response_template(template_key) or rule.get("fallback_message", "")}。
+     * Java 端 {@code SysScriptsConfig.getTemplate(key)} 返回 null 表示缺失，等价 Python 的 falsy。</p>
+     */
+    private String resolveGuardMessage(Map<String, Object> ruleMap) {
+        String templateKey = asString(ruleMap.get("response_template_key"));
+        String text = "";
+        if (scripts != null && templateKey != null && !templateKey.isBlank()) {
+            String resolved = scripts.getTemplate(templateKey);
+            if (resolved != null && !resolved.isBlank()) {
+                text = resolved;
+            }
+        }
+        if (text.isEmpty()) {
+            text = asString(ruleMap.get("fallback_message"));
+        }
+        return text;
+    }
+
+    /** guard 判定结果。blocked=true 表示超限需终止；其余字段仅用于日志。 */
+    private record GuardDecision(boolean blocked, String ruleId, int count, int maxCalls, String message) {
     }
 
     /**

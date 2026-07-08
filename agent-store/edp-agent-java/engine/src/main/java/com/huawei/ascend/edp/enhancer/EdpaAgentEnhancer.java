@@ -261,7 +261,7 @@ public class EdpaAgentEnhancer {
         // MCP / VA / ask_user Rail 负责工具调用前后的业务中断和参数增强。
         rails.add(new McpInterruptRail(edpConfig, sharedChannel, skillsDir, springBootConfig));
         rails.add(new VersatileInterruptRail(edpConfig, springBootConfig != null ? springBootConfig.getVersatile() : null,
-                sharedChannel, sharedPassthroughBuffer));
+                sharedChannel, sharedPassthroughBuffer, skillsDir, scripts));
         rails.add(new AskUserTemplateRail(edpConfig, scripts));
         // Log Rail 负责观测日志。
         rails.add(new LogRail(edpConfig));

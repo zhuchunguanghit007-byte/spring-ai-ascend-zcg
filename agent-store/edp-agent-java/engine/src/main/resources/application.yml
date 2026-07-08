@@ -35,7 +35,7 @@ edpa:
       api-key: ${EDP_AGENT_MODEL_API_KEY:sk-067b754046374d83888c52657ab6bbc7}
     versatile:
       url: ${EDP_AGENT_VERSATILE_URL:http://localhost:30001/v1/0/agent-manager/workflows/{workflow_id}/conversations/{conversation_id}}
-      adapter-a2a-url: ${EDP_AGENT_VERSATILE_A2A_URL:http://localhost:8191/a2a}
+      # adapter-a2a-url: ${EDP_AGENT_VERSATILE_A2A_URL:http://localhost:8191/a2a}
       timeout: ${EDP_AGENT_VERSATILE_TIMEOUT:30s}
       url-variables:
         workflow_id: mock_workflow
