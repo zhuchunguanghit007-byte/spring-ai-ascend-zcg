@@ -202,9 +202,10 @@ public final class ScriptResolver {
             return "";
         }
         StringBuilder sb = new StringBuilder("## 取消/超范围话术规则\n");
+        // UC-C03 两步取消：cancel_confirm 由 ask_user(status=cancel_confirm) 触发（见 businessRulesPrompt），
+        // cancel_task 的 reason 只列真正用于"执行取消"的 key，避免 LLM 混淆两步流程。
         sb.append("调用 cancel_task 时 reason 须取以下值之一（对应配置内话术）：");
         appendKey(sb, scripts, ScriptConstants.SCRIPT_TASK_CANCELLED, "取消任务");
-        appendKey(sb, scripts, ScriptConstants.SCRIPT_CANCEL_CONFIRM, "取消确认");
         appendKey(sb, scripts, ScriptConstants.SCRIPT_OUT_OF_SCOPE, "超范围");
         return sb.toString();
     }
@@ -226,6 +227,11 @@ public final class ScriptResolver {
         appendKey(sb, scripts, ScriptConstants.SCRIPT_PRODUCT_SELECT_MISSING_PRODUCT, "缺产品");
         appendKey(sb, scripts, ScriptConstants.SCRIPT_FUND_PLANNING_SUCCESS, "购买成功（vars: orderId）");
         appendKey(sb, scripts, ScriptConstants.SCRIPT_MCP_RESULT_EMPTY, "MCP 空结果");
+        // UC-C03 两步取消流程：第一步用 ask_user(status=cancel_confirm) 输出取消确认话术，
+        // 第二步用 cancel_task(reason=task_cancelled) 输出取消完成话术。
+        // cancel_confirm 在此列出以引导 LLM 用 ask_user 做取消确认时传对应话术参数，
+        // 避免漏传 status/keys 导致 Rail 走兜底拼接（与配置文案不一致）。
+        appendKey(sb, scripts, ScriptConstants.SCRIPT_CANCEL_CONFIRM, "取消确认（两步取消第一步）");
         return sb.toString();
     }
 

@@ -503,8 +503,11 @@ public class EdpaEventRail extends DeepAgentRail {
     @Override
     public void afterInvoke(AgentCallbackContext ctx) {
         String sid = sessionId(ctx);
-        // 出口 request_start：在 conversation_end 之前发射（EdpaEventRail priority=80 是唯一出口发射者）
-        // 当本轮有 interrupt_start（ask_user 中断）时不发射——interrupt_start.content 已携带话术文本，request_start 冗余
+        // 出口话术：在 conversation_end 之前发射（EdpaEventRail priority=80 是唯一出口发射者）。
+        // 对齐 Python agent.py 第 733-739 行：流末读 response_template → yield InterruptStartEvent。
+        // 事件类型用 INTERRUPT_START（非 REQUEST_START），interrupt_id="response_template" 与
+        // 中断路径（onToolException 的 uuid）区分，前端可按 interrupt_id 判断来源（UC-C03 验收 8）。
+        // 当本轮有 interrupt_start（ask_user 中断）时不发射——interrupt_start.content 已携带话术文本，出口冗余。
         Object rt = ctx.getExtra().get(ScriptConstants.KEY_RESPONSE_TEMPLATE);
         if (rt != null && !String.valueOf(rt).isBlank()) {
             if (!interruptActive.getOrDefault(sid, false)) {
@@ -515,10 +518,12 @@ public class EdpaEventRail extends DeepAgentRail {
                     resolved = scripts.getOrDefault(ScriptConstants.SCRIPT_OUT_OF_SCOPE, "");
                     LOGGER.info("[EDPA-DIAG] afterInvoke sid={} -> compliance gate replaced key={}", sid, lastKey);
                 }
-                LOGGER.info("[EDPA-DIAG] afterInvoke sid={} -> emit exit request_start (before conversation_end)", sid);
-                emit(ctx, EdpaEventType.REQUEST_START, Map.of("content", resolved));
+                LOGGER.info("[EDPA-DIAG] afterInvoke sid={} -> emit exit interrupt_start (before conversation_end)", sid);
+                emit(ctx, EdpaEventType.INTERRUPT_START, Map.of(
+                        "content", resolved,
+                        "interrupt_id", "response_template"));
             } else {
-                LOGGER.info("[EDPA-DIAG] afterInvoke sid={} -> skip exit request_start (interrupt active, content redundant)", sid);
+                LOGGER.info("[EDPA-DIAG] afterInvoke sid={} -> skip exit interrupt_start (interrupt active, content redundant)", sid);
             }
             ctx.getExtra().remove(ScriptConstants.KEY_RESPONSE_TEMPLATE);
         }
